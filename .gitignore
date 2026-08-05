@@ -1,0 +1,13 @@
+rfb-cnpj-dados-publicos
+.agents
+
+# Environment & Data files
+.env
+data/
+*.sqlite
+*.db
+*.tmp
+
+# Binaries
+cnpj-etl
+*.exe

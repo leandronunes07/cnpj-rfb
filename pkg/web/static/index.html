@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>CNPJ Engine - Agência Taruga</title>
+  <link rel="stylesheet" href="/styles.css">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+</head>
+<body>
+
+  <!-- Auth Modal -->
+  <div id="authModal" class="modal-overlay">
+    <div class="modal-card">
+      <div class="modal-header">
+        <div class="logo-badge">⚡ Taruga Engine</div>
+        <h2>Autenticação Requerida</h2>
+        <p>Informe a chave <code>API_TOKEN</code> cadastrada no arquivo <code>.env</code> para acessar o painel.</p>
+      </div>
+      <form id="authForm" class="modal-body">
+        <div class="input-group">
+          <label for="tokenInput">Chave API_TOKEN</label>
+          <input type="password" id="tokenInput" placeholder="Ex: taruga_secret_token_2026" required autocomplete="off">
+        </div>
+        <button type="submit" class="btn btn-primary btn-block">Acessar Painel</button>
+        <div id="authError" class="error-msg"></div>
+      </form>
+    </div>
+  </div>
+
+  <!-- Main Dashboard -->
+  <div class="app-layout">
+    <!-- Header -->
+    <header class="top-header">
+      <div class="brand">
+        <div class="brand-icon">⚡</div>
+        <div>
+          <h1>CNPJ Receita Federal ETL Engine</h1>
+          <span class="subbrand">Agência Taruga — <a href="https://www.agenciataruga.com" target="_blank">www.agenciataruga.com</a></span>
+        </div>
+      </div>
+      <div class="header-actions">
+        <span class="status-indicator online" id="serverStatusBadge">● Online</span>
+        <button id="triggerBtn" class="btn btn-secondary">⚡ Verificação Manual Receita</button>
+        <button id="logoutBtn" class="btn btn-outline">Sair</button>
+      </div>
+    </header>
+
+    <!-- Main Content -->
+    <main class="dashboard-body">
+      <!-- Stats Cards Grid -->
+      <section class="stats-grid">
+        <div class="stat-card">
+          <div class="stat-icon">🏢</div>
+          <div class="stat-info">
+            <span class="stat-label">Total de Empresas</span>
+            <span class="stat-value" id="totalEmpresas">---</span>
+          </div>
+        </div>
+
+        <div class="stat-card">
+          <div class="stat-icon">🏬</div>
+          <div class="stat-info">
+            <span class="stat-label">Estabelecimentos</span>
+            <span class="stat-value" id="totalEstab">---</span>
+          </div>
+        </div>
+
+        <div class="stat-card">
+          <div class="stat-icon">👥</div>
+          <div class="stat-info">
+            <span class="stat-label">Sócios Cadastrados</span>
+            <span class="stat-value" id="totalSocios">---</span>
+          </div>
+        </div>
+
+        <div class="stat-card">
+          <div class="stat-icon">📅</div>
+          <div class="stat-info">
+            <span class="stat-label">Última Competência</span>
+            <span class="stat-value highlight" id="ultimaCompetencia">---</span>
+          </div>
+        </div>
+      </section>
+
+      <!-- Sandbox & Live Logs Grid -->
+      <section class="panels-grid">
+        <!-- Live Log Console -->
+        <div class="panel-card console-panel">
+          <div class="panel-header">
+            <h3>🖥️ Stream de Logs do ETL (Real-Time)</h3>
+            <span class="badge">Live SSE</span>
+          </div>
+          <div class="console-box" id="logConsole">
+            <div class="log-line info">[System] Conectado ao stream de logs do servidor em tempo real...</div>
+          </div>
+        </div>
+
+        <!-- API Sandbox & CNPJ Tester -->
+        <div class="panel-card api-panel">
+          <div class="panel-header">
+            <h3>🔎 Testador de API & Busca de CNPJ</h3>
+            <span class="badge">API REST v1</span>
+          </div>
+
+          <div class="tab-controls">
+            <button class="tab-btn active" data-tab="tabCnpj">Buscar CNPJ</button>
+            <button class="tab-btn" data-tab="tabSearch">Busca por Nome/UF</button>
+          </div>
+
+          <!-- Tab CNPJ -->
+          <div id="tabCnpj" class="tab-content active">
+            <div class="input-group">
+              <label for="searchCnpjInput">CNPJ (Alfanumérico ou Numérico)</label>
+              <div class="input-row">
+                <input type="text" id="searchCnpjInput" placeholder="Ex: 00000000000191 ou 12ABC345A00195" maxlength="18">
+                <button id="btnSearchCnpj" class="btn btn-primary">Consultar</button>
+              </div>
+            </div>
+          </div>
+
+          <!-- Tab Search -->
+          <div id="tabSearch" class="tab-content">
+            <div class="input-group">
+              <label for="searchQueryInput">Razão Social ou Nome Fantasia</label>
+              <div class="input-row">
+                <input type="text" id="searchQueryInput" placeholder="Ex: Agência Taruga">
+                <input type="text" id="searchUfInput" placeholder="UF (ex: MG)" style="width: 80px;">
+                <button id="btnSearchQuery" class="btn btn-primary">Buscar</button>
+              </div>
+            </div>
+          </div>
+
+          <!-- Result Container -->
+          <div class="result-box" id="apiResultBox">
+            <pre id="apiResultJson">// O resultado da consulta JSON aparecerá aqui...</pre>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <footer class="footer">
+      <p>Desenvolvido por <strong>Leandro Oliveira Nunes</strong> — <strong>Agência Taruga</strong> (<a href="https://www.agenciataruga.com" target="_blank">www.agenciataruga.com</a>)</p>
+    </footer>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>

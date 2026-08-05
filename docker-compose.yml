@@ -1,0 +1,27 @@
+version: '3.8'
+
+services:
+  cnpj-etl:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: cnpj-etl-engine
+    restart: always
+    environment:
+      - DB_DRIVER=${DB_DRIVER:-postgres}
+      - DB_HOST=${DB_HOST:-postgres}
+      - DB_PORT=${DB_PORT:-5432}
+      - DB_USER=${DB_USER:-postgres}
+      - DB_PASSWORD=${DB_PASSWORD:-postgres_password}
+      - DB_NAME=${DB_NAME:-cnpj}
+      - DB_SSLMODE=${DB_SSLMODE:-disable}
+      - DOWNLOAD_WORKERS=${DOWNLOAD_WORKERS:-4}
+      - BATCH_SIZE=${BATCH_SIZE:-5000}
+      - AUTO_CLEANUP=${AUTO_CLEANUP:-true}
+      - CRON_SCHEDULE=${CRON_SCHEDULE:-0 3 1 * *}
+      - RUN_ONCE=${RUN_ONCE:-false}
+    volumes:
+      - etl_data:/app/data
+
+volumes:
+  etl_data:
