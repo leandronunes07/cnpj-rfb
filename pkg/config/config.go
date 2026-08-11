@@ -71,7 +71,7 @@ func LoadConfig() (*Config, error) {
 		return nil, fmt.Errorf("failed creating db file directory: %w", err)
 	}
 
-	baseURL := getEnv("DATA_BASE_URL", "https://arquivos.receitafederal.gov.br/dados/cnpj/dados_abertos_cnpj/")
+	baseURL := getEnv("DATA_BASE_URL", "https://arquivos.receitafederal.gov.br/index.php/s/YggdBLfdninEJX9")
 	if !strings.HasSuffix(baseURL, "/") {
 		baseURL += "/"
 	}
@@ -94,7 +94,7 @@ func LoadConfig() (*Config, error) {
 		DownloadWorkers: getEnvAsInt("DOWNLOAD_WORKERS", 4),
 		BatchSize:       getEnvAsInt("BATCH_SIZE", 5000),
 		AutoCleanup:     getEnvAsBool("AUTO_CLEANUP", true),
-		CronSchedule:    getEnv("CRON_SCHEDULE", "0 3 1 * *"),
+		CronSchedule:    getEnv("CRON_SCHEDULE", "0 3 * * *"),
 		RunOnce:         getEnvAsBool("RUN_ONCE", false),
 	}
 

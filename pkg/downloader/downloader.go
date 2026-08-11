@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -21,7 +22,12 @@ func NewDownloader(workers int) *Downloader {
 	return &Downloader{
 		Workers: workers,
 		HTTPClient: &http.Client{
-			Timeout: 30 * time.Minute, // Long timeout for large zip downloads
+			Timeout: 2 * time.Hour, // Aumentado para 2 horas para permitir o download completo de arquivos grandes (1.5GB+) em conexões mais lentas
+			Transport: &http.Transport{
+				ResponseHeaderTimeout: 2 * time.Minute,
+				IdleConnTimeout:       3 * time.Minute,
+				TLSHandshakeTimeout:   30 * time.Second,
+			},
 		},
 	}
 }
@@ -33,12 +39,16 @@ type DownloadTask struct {
 }
 
 func (d *Downloader) DownloadAll(tasks []DownloadTask) error {
+	return d.DownloadStream(tasks, nil)
+}
+
+func (d *Downloader) DownloadStream(tasks []DownloadTask, onComplete func(task DownloadTask) error) error {
 	if len(tasks) == 0 {
 		log.Println("[Downloader] Nenhum arquivo para baixar.")
 		return nil
 	}
 
-	log.Printf("[Downloader] Iniciando download de %d arquivo(s) com %d worker(s)...", len(tasks), d.Workers)
+	log.Printf("[Downloader] Iniciando download em stream de %d arquivo(s) com %d worker(s)...", len(tasks), d.Workers)
 
 	taskChan := make(chan DownloadTask, len(tasks))
 	errChan := make(chan error, len(tasks))
@@ -56,7 +66,14 @@ func (d *Downloader) DownloadAll(tasks []DownloadTask) error {
 					errChan <- fmt.Errorf("failed downloading %s: %w", task.Filename, err)
 					return
 				}
-				log.Printf("[Worker %d] Concluído: %s", workerID, task.Filename)
+				log.Printf("[Worker %d] Concluído download: %s", workerID, task.Filename)
+				if onComplete != nil {
+					if err := onComplete(task); err != nil {
+						log.Printf("[Worker %d] ERRO ao processar %s: %v", workerID, task.Filename, err)
+						errChan <- fmt.Errorf("failed processing %s: %w", task.Filename, err)
+						return
+					}
+				}
 			}
 		}(i)
 	}
@@ -86,7 +103,37 @@ func (d *Downloader) downloadFile(task DownloadTask) error {
 		return nil
 	}
 
-	resp, err := d.HTTPClient.Get(task.URL)
+	maxRetries := 3
+	var lastErr error
+
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		if attempt > 1 {
+			log.Printf("[Downloader] Tentativa %d/%d para baixar %s...", attempt, maxRetries, task.Filename)
+			time.Sleep(time.Duration(attempt*3) * time.Second)
+		}
+
+		err := d.doDownload(task)
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		log.Printf("[Downloader] Falha na tentativa %d ao baixar %s: %v", attempt, task.Filename, err)
+	}
+
+	return lastErr
+}
+
+func (d *Downloader) doDownload(task DownloadTask) error {
+	req, err := http.NewRequest("GET", task.URL, nil)
+	if err != nil {
+		return fmt.Errorf("failed to create GET request: %w", err)
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+	if strings.Contains(task.URL, "receitafederal.gov.br") {
+		req.SetBasicAuth("YggdBLfdninEJX9", "")
+	}
+
+	resp, err := d.HTTPClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("HTTP GET request failed: %w", err)
 	}
@@ -119,7 +166,7 @@ func (d *Downloader) downloadFile(task DownloadTask) error {
 	return nil
 }
 
-func (d *Downloader) needsDownload(url string, destPath string) bool {
+func (d *Downloader) needsDownload(targetURL string, destPath string) bool {
 	info, err := os.Stat(destPath)
 	if os.IsNotExist(err) {
 		return true
@@ -129,9 +176,13 @@ func (d *Downloader) needsDownload(url string, destPath string) bool {
 	}
 
 	// Check HEAD remote Content-Length
-	req, err := http.NewRequest("HEAD", url, nil)
+	req, err := http.NewRequest("HEAD", targetURL, nil)
 	if err != nil {
 		return true
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+	if strings.Contains(targetURL, "receitafederal.gov.br") {
+		req.SetBasicAuth("YggdBLfdninEJX9", "")
 	}
 	resp, err := d.HTTPClient.Do(req)
 	if err != nil || resp.StatusCode >= 400 {

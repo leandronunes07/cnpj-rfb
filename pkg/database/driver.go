@@ -13,6 +13,8 @@ type DBDriver interface {
 	InitSchema() error
 	GetLatestProcessedMonth() (string, error)
 	SaveProcessedMonth(month string) error
+	IsFileProcessed(dataMonth string, filename string) (bool, error)
+	SaveProcessedFile(dataMonth string, filename string, status string) error
 	InsertBatch(table schema.TableSpec, rows [][]string) error
 	GetCNPJ(cnpj string) (map[string]interface{}, error)
 	SearchCNPJ(query string, uf string, limit int) ([]map[string]interface{}, error)

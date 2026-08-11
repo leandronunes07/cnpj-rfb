@@ -32,4 +32,6 @@ RUN mkdir -p /app/data/zip /app/data/extracted
 
 VOLUME ["/app/data"]
 
+EXPOSE 8080
+
 ENTRYPOINT ["/app/cnpj-etl"]

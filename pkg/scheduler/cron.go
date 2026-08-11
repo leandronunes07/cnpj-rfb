@@ -26,12 +26,12 @@ func NewScheduler(cfg *config.Config, pipeline *etl.Pipeline) *Scheduler {
 }
 
 func (s *Scheduler) Start() error {
-	log.Printf("[Scheduler] Configurando agendador mensal com expressão cron: '%s'", s.cfg.CronSchedule)
+	log.Printf("[Scheduler] Configurando agendador diário com expressão cron: '%s'", s.cfg.CronSchedule)
 
 	_, err := s.cron.AddFunc(s.cfg.CronSchedule, func() {
-		log.Println("[Scheduler] Executando rotina mensal agendada da Receita Federal...")
+		log.Println("[Scheduler] Executando rotina diária agendada da Receita Federal...")
 		if err := s.pipeline.Run(); err != nil {
-			log.Printf("[Scheduler] ERRO na rotina mensal: %v", err)
+			log.Printf("[Scheduler] ERRO na rotina agendada: %v", err)
 		}
 	})
 	if err != nil {

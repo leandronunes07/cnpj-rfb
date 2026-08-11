@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/leandronunes07/cnpj-rfb/pkg/config"
@@ -50,29 +51,38 @@ func (p *Pipeline) Run() error {
 
 	log.Printf("[ETL Pipeline] Competência alvo identificada: %s", targetMonth)
 
-	// Check if already processed
-	lastProcessed, err := p.db.GetLatestProcessedMonth()
-	if err != nil {
-		log.Printf("[ETL Pipeline] Warning ao verificar histórico de metadados: %v", err)
-	}
-
-	if lastProcessed != "" && lastProcessed == targetMonth {
-		log.Printf("[ETL Pipeline] A competência %s já foi processada anteriormente. Nenhuma ação necessária.", targetMonth)
-		return nil
-	}
-
-	log.Printf("[ETL Pipeline] Nova competência %s detectada! (Última processada: %s)", targetMonth, lastProcessed)
-
 	dataURL, zipFiles, err := p.crawler.ListZipFiles(targetMonth)
 	if err != nil {
 		return fmt.Errorf("erro ao listar arquivos zip para a competência %s: %w", targetMonth, err)
 	}
 
-	log.Printf("[ETL Pipeline] Encontrados %d arquivos .zip no servidor da Receita.", len(zipFiles))
+	log.Printf("[ETL Pipeline] Encontrados %d arquivos .zip no servidor da Receita para %s.", len(zipFiles), targetMonth)
 
-	// Build download tasks
-	var tasks []downloader.DownloadTask
+	// Filter files already processed in DB
+	var pendingZipFiles []string
 	for _, zipName := range zipFiles {
+		processed, err := p.db.IsFileProcessed(targetMonth, zipName)
+		if err != nil {
+			log.Printf("[ETL Pipeline] Warning ao verificar histórico do arquivo %s: %v", zipName, err)
+		}
+		if processed {
+			log.Printf("[ETL Pipeline] Arquivo %s já foi inserido no banco (ignorado).", zipName)
+			continue
+		}
+		pendingZipFiles = append(pendingZipFiles, zipName)
+	}
+
+	if len(pendingZipFiles) == 0 {
+		log.Printf("[ETL Pipeline] Todos os %d arquivos da competência %s já foram processados. Nenhuma ação necessária.", len(zipFiles), targetMonth)
+		_ = p.db.SaveProcessedMonth(targetMonth)
+		return nil
+	}
+
+	log.Printf("[ETL Pipeline] Encontrados %d arquivos pendentes para download e carga.", len(pendingZipFiles))
+
+	// Build download tasks for pending files only
+	var tasks []downloader.DownloadTask
+	for _, zipName := range pendingZipFiles {
 		fileURL, err := p.crawler.BuildFileURL(dataURL, zipName)
 		if err != nil {
 			log.Printf("[ETL Pipeline] Warning ao resolver URL para %s: %v", zipName, err)
@@ -86,22 +96,24 @@ func (p *Pipeline) Run() error {
 		})
 	}
 
-	// Download phase
+	// Download & Stream Load Phase (Intercalado)
 	startTime := time.Now()
-	if err := p.downloader.DownloadAll(tasks); err != nil {
-		return fmt.Errorf("falha no download dos arquivos: %w", err)
-	}
+	var importMu sync.Mutex
 
-	// Extraction and Load Phase
-	for _, task := range tasks {
-		log.Printf("[ETL Pipeline] Processando arquivo: %s", task.Filename)
+	err = p.downloader.DownloadStream(tasks, func(task downloader.DownloadTask) error {
+		importMu.Lock()
+		defer importMu.Unlock()
+
+		log.Printf("[ETL Pipeline] Processando imediatamente arquivo baixado: %s", task.Filename)
 
 		extractedFiles, err := p.extractor.ExtractZip(task.DestPath, p.cfg.ExtractedDir)
 		if err != nil {
 			log.Printf("[ETL Pipeline] ERRO ao descompactar %s: %v", task.Filename, err)
-			continue
+			return nil
 		}
 
+		matchedCount := 0
+		fileImportSuccess := true
 		for _, extFile := range extractedFiles {
 			baseName := filepath.Base(extFile)
 			tableSpec := matchTableSpec(baseName)
@@ -111,9 +123,11 @@ func (p *Pipeline) Run() error {
 				continue
 			}
 
+			matchedCount++
 			log.Printf("[ETL Pipeline] Importando dados de %s para a tabela `%s`...", baseName, tableSpec.Name)
 			if err := p.importFileToTable(extFile, *tableSpec); err != nil {
 				log.Printf("[ETL Pipeline] ERRO ao importar %s para `%s`: %v", baseName, tableSpec.Name, err)
+				fileImportSuccess = false
 			}
 
 			// Clean up extracted file immediately
@@ -128,6 +142,22 @@ func (p *Pipeline) Run() error {
 			_ = os.Remove(task.DestPath)
 			log.Printf("[Auto-Cleanup] Arquivo ZIP removido: %s", task.Filename)
 		}
+
+		if matchedCount > 0 && fileImportSuccess {
+			if err := p.db.SaveProcessedFile(targetMonth, task.Filename, "SUCCESS"); err != nil {
+				log.Printf("[ETL Pipeline] ERRO ao registrar arquivo %s no banco: %v", task.Filename, err)
+			} else {
+				log.Printf("[ETL Pipeline] Arquivo %s importado no banco e registrado com sucesso!", task.Filename)
+			}
+		} else if matchedCount == 0 {
+			log.Printf("[ETL Pipeline] ATENÇÃO: NENHUM SCHEMA CORRESPONDIDO para %s. O arquivo NÃO foi marcado como concluído no banco.", task.Filename)
+		}
+
+		return nil
+	})
+
+	if err != nil {
+		return fmt.Errorf("falha no pipeline de download e carga: %w", err)
 	}
 
 	// Record success in etl_metadata
@@ -149,9 +179,23 @@ func (p *Pipeline) importFileToTable(filePath string, table schema.TableSpec) er
 	var batch [][]string
 	totalRows := 0
 
+	// Dinamiza o tamanho do batch para evitar limite de placeholders (65535 no MySQL/Postgres)
+	maxPlaceholders := 65000
+	if p.cfg.DBDriver == "sqlite" {
+		maxPlaceholders = 32700 // SQLite modern limit
+	}
+
+	batchLimit := maxPlaceholders / len(table.Columns)
+	if batchLimit == 0 {
+		batchLimit = 1
+	}
+	if batchLimit > p.cfg.BatchSize {
+		batchLimit = p.cfg.BatchSize
+	}
+
 	err := p.extractor.StreamCSVRows(filePath, func(row []string) error {
 		batch = append(batch, row)
-		if len(batch) >= p.cfg.BatchSize {
+		if len(batch) >= batchLimit {
 			if err := p.db.InsertBatch(table, batch); err != nil {
 				return err
 			}
@@ -181,7 +225,7 @@ func matchTableSpec(filename string) *schema.TableSpec {
 	upperName := strings.ToUpper(filename)
 	for _, t := range schema.Tables {
 		for _, prefix := range t.Prefixes {
-			if strings.HasPrefix(upperName, prefix) {
+			if strings.Contains(upperName, prefix) {
 				return &t
 			}
 		}

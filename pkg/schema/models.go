@@ -27,7 +27,7 @@ var Tables = []TableSpec{
 	},
 	{
 		Name:     "estabelecimento",
-		Prefixes: []string{"ESTABELE"},
+		Prefixes: []string{"ESTABELE", "ESTAB"},
 		Columns: []Column{
 			{Name: "cnpj_basico", Type: "TEXT"},
 			{Name: "cnpj_ordem", Type: "TEXT"},
@@ -80,7 +80,7 @@ var Tables = []TableSpec{
 	},
 	{
 		Name:     "simples",
-		Prefixes: []string{"SIMPLES"},
+		Prefixes: []string{"SIMPLES", "SIMPLECS", "SIMPLE"},
 		Columns: []Column{
 			{Name: "cnpj_basico", Type: "TEXT"},
 			{Name: "opcao_pelo_simples", Type: "TEXT"},
@@ -100,7 +100,7 @@ var Tables = []TableSpec{
 		},
 	},
 	{
-		Name:     "moti",
+		Name:     "motivo_situacao_cadastral",
 		Prefixes: []string{"MOTI"},
 		Columns: []Column{
 			{Name: "codigo", Type: "INTEGER"},
@@ -108,7 +108,7 @@ var Tables = []TableSpec{
 		},
 	},
 	{
-		Name:     "munic",
+		Name:     "municipio",
 		Prefixes: []string{"MUNIC"},
 		Columns: []Column{
 			{Name: "codigo", Type: "INTEGER"},
@@ -116,7 +116,7 @@ var Tables = []TableSpec{
 		},
 	},
 	{
-		Name:     "natju",
+		Name:     "natureza_juridica",
 		Prefixes: []string{"NATJU"},
 		Columns: []Column{
 			{Name: "codigo", Type: "INTEGER"},
@@ -132,8 +132,8 @@ var Tables = []TableSpec{
 		},
 	},
 	{
-		Name:     "quals",
-		Prefixes: []string{"QUALS"},
+		Name:     "qualificacao_socio",
+		Prefixes: []string{"QUALS", "QUAL"},
 		Columns: []Column{
 			{Name: "codigo", Type: "INTEGER"},
 			{Name: "descricao", Type: "TEXT"},

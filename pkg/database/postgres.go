@@ -73,11 +73,18 @@ func (p *PostgresDriver) InitSchema() error {
 	createMetaTable := `
 	CREATE TABLE IF NOT EXISTS etl_metadata (
 		id SERIAL PRIMARY KEY,
-		data_month VARCHAR(7) NOT UNIQUE NOT NULL,
+		data_month VARCHAR(7) NOT NULL,
+		processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+	);
+	CREATE TABLE IF NOT EXISTS etl_processed_files (
+		id SERIAL PRIMARY KEY,
+		data_month VARCHAR(7) NOT NULL,
+		filename VARCHAR(255) NOT NULL,
+		status VARCHAR(32) NOT NULL,
 		processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 	);`
 	if _, err := p.db.Exec(createMetaTable); err != nil {
-		return fmt.Errorf("failed creating etl_metadata table: %w", err)
+		return fmt.Errorf("failed creating etl_metadata/etl_processed_files tables: %w", err)
 	}
 
 	for _, t := range schema.Tables {
@@ -90,7 +97,18 @@ func (p *PostgresDriver) InitSchema() error {
 			colDefs = append(colDefs, fmt.Sprintf("%s %s", col.Name, pgType))
 		}
 
-		ddl := fmt.Sprintf("CREATE TABLE IF NOT EXISTS %s (%s);", t.Name, strings.Join(colDefs, ", "))
+		var primaryKeyClause string
+		if t.Name == "empresa" {
+			primaryKeyClause = ", PRIMARY KEY (cnpj_basico)"
+		} else if t.Name == "estabelecimento" {
+			primaryKeyClause = ", PRIMARY KEY (cnpj_basico, cnpj_ordem, cnpj_dv)"
+		} else if t.Name == "simples" {
+			primaryKeyClause = ", PRIMARY KEY (cnpj_basico)"
+		} else if len(t.Columns) > 0 && t.Columns[0].Name == "codigo" {
+			primaryKeyClause = ", PRIMARY KEY (codigo)"
+		}
+
+		ddl := fmt.Sprintf("CREATE TABLE IF NOT EXISTS %s (%s%s);", t.Name, strings.Join(colDefs, ", "), primaryKeyClause)
 		if _, err := p.db.Exec(ddl); err != nil {
 			return fmt.Errorf("failed creating table %s: %w", t.Name, err)
 		}
@@ -98,9 +116,16 @@ func (p *PostgresDriver) InitSchema() error {
 
 	indexes := []string{
 		"CREATE INDEX IF NOT EXISTS idx_empresa_cnpj ON empresa(cnpj_basico);",
+		"CREATE INDEX IF NOT EXISTS idx_empresa_razao ON empresa(razao_social);",
 		"CREATE INDEX IF NOT EXISTS idx_estabelecimento_cnpj ON estabelecimento(cnpj_basico);",
+		"CREATE INDEX IF NOT EXISTS idx_estabelecimento_uf ON estabelecimento(uf);",
+		"CREATE INDEX IF NOT EXISTS idx_estabelecimento_municipio ON estabelecimento(municipio);",
+		"CREATE INDEX IF NOT EXISTS idx_estabelecimento_cnae ON estabelecimento(cnae_fiscal_principal);",
+		"CREATE INDEX IF NOT EXISTS idx_estabelecimento_situacao ON estabelecimento(situacao_cadastral);",
+		"CREATE INDEX IF NOT EXISTS idx_estabelecimento_fantasia ON estabelecimento(nome_fantasia);",
 		"CREATE INDEX IF NOT EXISTS idx_socios_cnpj ON socios(cnpj_basico);",
 		"CREATE INDEX IF NOT EXISTS idx_simples_cnpj ON simples(cnpj_basico);",
+		"CREATE INDEX IF NOT EXISTS idx_etl_files_month_file ON etl_processed_files(data_month, filename);",
 	}
 
 	for _, idx := range indexes {
@@ -116,16 +141,23 @@ func (p *PostgresDriver) InitSchema() error {
 		emp.razao_social,
 		e.nome_fantasia,
 		e.situacao_cadastral,
+		moti.descricao AS motivo_situacao_cadastral,
 		e.uf,
-		e.municipio,
+		mun.descricao AS municipio,
+		cnae.descricao AS cnae_fiscal_principal_descricao,
 		e.cnae_fiscal_principal,
+		nat.descricao AS natureza_juridica,
 		e.correio_eletronico,
 		e.telefone_1,
 		s.opcao_pelo_simples,
 		s.opcao_mei
 	FROM estabelecimento e
 	LEFT JOIN empresa emp ON e.cnpj_basico = emp.cnpj_basico
-	LEFT JOIN simples s ON e.cnpj_basico = s.cnpj_basico;`
+	LEFT JOIN simples s ON e.cnpj_basico = s.cnpj_basico
+	LEFT JOIN cnae cnae ON e.cnae_fiscal_principal = cnae.codigo
+	LEFT JOIN municipio mun ON e.municipio = mun.codigo
+	LEFT JOIN motivo_situacao_cadastral moti ON e.motivo_situacao_cadastral = moti.codigo
+	LEFT JOIN natureza_juridica nat ON emp.natureza_juridica = nat.codigo;`
 	if _, err := p.db.Exec(createView); err != nil {
 		log.Printf("[PostgreSQL] Warning ao criar view vw_cnpj_completo: %v", err)
 	}
@@ -148,6 +180,20 @@ func (p *PostgresDriver) GetLatestProcessedMonth() (string, error) {
 
 func (p *PostgresDriver) SaveProcessedMonth(month string) error {
 	_, err := p.db.Exec("INSERT INTO etl_metadata (data_month) VALUES ($1)", month)
+	return err
+}
+
+func (p *PostgresDriver) IsFileProcessed(dataMonth string, filename string) (bool, error) {
+	var count int
+	err := p.db.QueryRow("SELECT COUNT(*) FROM etl_processed_files WHERE data_month = $1 AND filename = $2 AND status = 'SUCCESS'", dataMonth, filename).Scan(&count)
+	if err != nil {
+		return false, err
+	}
+	return count > 0, nil
+}
+
+func (p *PostgresDriver) SaveProcessedFile(dataMonth string, filename string, status string) error {
+	_, err := p.db.Exec("INSERT INTO etl_processed_files (data_month, filename, status) VALUES ($1, $2, $3)", dataMonth, filename, status)
 	return err
 }
 
@@ -186,7 +232,7 @@ func (p *PostgresDriver) InsertBatch(table schema.TableSpec, rows [][]string) er
 		valueStrings = append(valueStrings, fmt.Sprintf("(%s)", strings.Join(placeholders, ", ")))
 	}
 
-	stmtStr := fmt.Sprintf("INSERT INTO %s (%s) VALUES %s", table.Name, strings.Join(cols, ", "), strings.Join(valueStrings, ", "))
+	stmtStr := fmt.Sprintf("INSERT INTO %s (%s) VALUES %s ON CONFLICT DO NOTHING", table.Name, strings.Join(cols, ", "), strings.Join(valueStrings, ", "))
 
 	if _, err := tx.Exec(stmtStr, valueArgs...); err != nil {
 		return fmt.Errorf("bulk insert error in table %s: %w", table.Name, err)

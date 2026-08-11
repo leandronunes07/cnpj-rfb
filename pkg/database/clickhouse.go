@@ -57,9 +57,16 @@ func (c *ClickHouseDriver) InitSchema() error {
 		id UInt64,
 		data_month String,
 		processed_at DateTime DEFAULT now()
-	) ENGINE = MergeTree() ORDER BY id;`
+	) ENGINE = MergeTree() ORDER BY id;
+	CREATE TABLE IF NOT EXISTS etl_processed_files (
+		id UInt64,
+		data_month String,
+		filename String,
+		status String,
+		processed_at DateTime DEFAULT now()
+	) ENGINE = MergeTree() ORDER BY (data_month, filename);`
 	if _, err := c.db.Exec(createMetaTable); err != nil {
-		return fmt.Errorf("failed creating etl_metadata table: %w", err)
+		return fmt.Errorf("failed creating etl_metadata/etl_processed_files tables: %w", err)
 	}
 
 	for _, t := range schema.Tables {
@@ -112,6 +119,20 @@ func (c *ClickHouseDriver) GetLatestProcessedMonth() (string, error) {
 
 func (c *ClickHouseDriver) SaveProcessedMonth(month string) error {
 	_, err := c.db.Exec("INSERT INTO etl_metadata (id, data_month) VALUES (?, ?)", time.Now().UnixNano(), month)
+	return err
+}
+
+func (c *ClickHouseDriver) IsFileProcessed(dataMonth string, filename string) (bool, error) {
+	var count uint64
+	err := c.db.QueryRow("SELECT count() FROM etl_processed_files WHERE data_month = ? AND filename = ? AND status = 'SUCCESS'", dataMonth, filename).Scan(&count)
+	if err != nil {
+		return false, err
+	}
+	return count > 0, nil
+}
+
+func (c *ClickHouseDriver) SaveProcessedFile(dataMonth string, filename string, status string) error {
+	_, err := c.db.Exec("INSERT INTO etl_processed_files (id, data_month, filename, status) VALUES (?, ?, ?, ?)", time.Now().UnixNano(), dataMonth, filename, status)
 	return err
 }
 

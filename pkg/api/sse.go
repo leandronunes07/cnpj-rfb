@@ -2,7 +2,10 @@ package api
 
 import (
 	"fmt"
+	"io"
 	"net/http"
+	"os"
+	"strings"
 	"sync"
 )
 
@@ -33,7 +36,7 @@ func (b *SSEBroadcaster) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 
-	clientChan := make(chan string, 10)
+	clientChan := make(chan string, 100)
 
 	b.mu.Lock()
 	b.clients[clientChan] = true
@@ -58,4 +61,22 @@ func (b *SSEBroadcaster) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+}
+
+type LogBroadcasterWriter struct {
+	stdOut io.Writer
+}
+
+func NewLogBroadcasterWriter() io.Writer {
+	return &LogBroadcasterWriter{
+		stdOut: os.Stderr,
+	}
+}
+
+func (w *LogBroadcasterWriter) Write(p []byte) (n int, err error) {
+	msg := strings.TrimSpace(string(p))
+	if msg != "" {
+		GlobalBroadcaster.Broadcast(msg)
+	}
+	return w.stdOut.Write(p)
 }

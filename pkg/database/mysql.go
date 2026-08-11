@@ -71,9 +71,16 @@ func (m *MySQLDriver) InitSchema() error {
 		id INT AUTO_INCREMENT PRIMARY KEY,
 		data_month VARCHAR(7) NOT NULL,
 		processed_at DATETIME DEFAULT CURRENT_TIMESTAMP
+	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+	CREATE TABLE IF NOT EXISTS etl_processed_files (
+		id INT AUTO_INCREMENT PRIMARY KEY,
+		data_month VARCHAR(7) NOT NULL,
+		filename VARCHAR(255) NOT NULL,
+		status VARCHAR(32) NOT NULL,
+		processed_at DATETIME DEFAULT CURRENT_TIMESTAMP
 	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;`
 	if _, err := m.db.Exec(createMetaTable); err != nil {
-		return fmt.Errorf("failed creating etl_metadata table: %w", err)
+		return fmt.Errorf("failed creating etl_metadata/etl_processed_files tables: %w", err)
 	}
 
 	for _, t := range schema.Tables {
@@ -92,11 +99,24 @@ func (m *MySQLDriver) InitSchema() error {
 				mySQLType = "VARCHAR(2)"
 			} else if col.Name == "codigo" {
 				mySQLType = "INT"
+			} else if col.Name == "uf" {
+				mySQLType = "VARCHAR(2)"
 			}
 			colDefs = append(colDefs, fmt.Sprintf("`%s` %s", col.Name, mySQLType))
 		}
 
-		ddl := fmt.Sprintf("CREATE TABLE IF NOT EXISTS `%s` (%s) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;", t.Name, strings.Join(colDefs, ", "))
+		var primaryKeyClause string
+		if t.Name == "empresa" {
+			primaryKeyClause = ", PRIMARY KEY (`cnpj_basico`)"
+		} else if t.Name == "estabelecimento" {
+			primaryKeyClause = ", PRIMARY KEY (`cnpj_basico`, `cnpj_ordem`, `cnpj_dv`)"
+		} else if t.Name == "simples" {
+			primaryKeyClause = ", PRIMARY KEY (`cnpj_basico`)"
+		} else if len(t.Columns) > 0 && t.Columns[0].Name == "codigo" {
+			primaryKeyClause = ", PRIMARY KEY (`codigo`)"
+		}
+
+		ddl := fmt.Sprintf("CREATE TABLE IF NOT EXISTS `%s` (%s%s) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;", t.Name, strings.Join(colDefs, ", "), primaryKeyClause)
 		if _, err := m.db.Exec(ddl); err != nil {
 			return fmt.Errorf("failed creating table %s: %w", t.Name, err)
 		}
@@ -104,9 +124,16 @@ func (m *MySQLDriver) InitSchema() error {
 
 	indexes := []map[string]string{
 		{"table": "empresa", "name": "idx_empresa_cnpj", "col": "cnpj_basico"},
+		{"table": "empresa", "name": "idx_empresa_razao", "col": "razao_social(100)"},
 		{"table": "estabelecimento", "name": "idx_estabelecimento_cnpj", "col": "cnpj_basico"},
+		{"table": "estabelecimento", "name": "idx_estabelecimento_uf", "col": "uf"},
+		{"table": "estabelecimento", "name": "idx_estabelecimento_municipio", "col": "municipio"},
+		{"table": "estabelecimento", "name": "idx_estabelecimento_cnae", "col": "cnae_fiscal_principal"},
+		{"table": "estabelecimento", "name": "idx_estabelecimento_situacao", "col": "situacao_cadastral"},
+		{"table": "estabelecimento", "name": "idx_estabelecimento_fantasia", "col": "nome_fantasia(100)"},
 		{"table": "socios", "name": "idx_socios_cnpj", "col": "cnpj_basico"},
 		{"table": "simples", "name": "idx_simples_cnpj", "col": "cnpj_basico"},
+		{"table": "etl_processed_files", "name": "idx_etl_files_month_file", "col": "data_month, filename"},
 	}
 
 	for _, idx := range indexes {
@@ -123,16 +150,23 @@ func (m *MySQLDriver) InitSchema() error {
 		emp.razao_social,
 		e.nome_fantasia,
 		e.situacao_cadastral,
+		moti.descricao AS motivo_situacao_cadastral,
 		e.uf,
-		e.municipio,
+		mun.descricao AS municipio,
+		cnae.descricao AS cnae_fiscal_principal_descricao,
 		e.cnae_fiscal_principal,
+		nat.descricao AS natureza_juridica,
 		e.correio_eletronico,
 		e.telefone_1,
 		s.opcao_pelo_simples,
 		s.opcao_mei
 	FROM estabelecimento e
 	LEFT JOIN empresa emp ON e.cnpj_basico = emp.cnpj_basico
-	LEFT JOIN simples s ON e.cnpj_basico = s.cnpj_basico;`
+	LEFT JOIN simples s ON e.cnpj_basico = s.cnpj_basico
+	LEFT JOIN cnae cnae ON e.cnae_fiscal_principal = cnae.codigo
+	LEFT JOIN municipio mun ON e.municipio = mun.codigo
+	LEFT JOIN motivo_situacao_cadastral moti ON e.motivo_situacao_cadastral = moti.codigo
+	LEFT JOIN natureza_juridica nat ON emp.natureza_juridica = nat.codigo;`
 	if _, err := m.db.Exec(createView); err != nil {
 		log.Printf("[MySQL] Warning ao criar view vw_cnpj_completo: %v", err)
 	}
@@ -155,6 +189,20 @@ func (m *MySQLDriver) GetLatestProcessedMonth() (string, error) {
 
 func (m *MySQLDriver) SaveProcessedMonth(month string) error {
 	_, err := m.db.Exec("INSERT INTO etl_metadata (data_month) VALUES (?)", month)
+	return err
+}
+
+func (m *MySQLDriver) IsFileProcessed(dataMonth string, filename string) (bool, error) {
+	var count int
+	err := m.db.QueryRow("SELECT COUNT(*) FROM etl_processed_files WHERE data_month = ? AND filename = ? AND status = 'SUCCESS'", dataMonth, filename).Scan(&count)
+	if err != nil {
+		return false, err
+	}
+	return count > 0, nil
+}
+
+func (m *MySQLDriver) SaveProcessedFile(dataMonth string, filename string, status string) error {
+	_, err := m.db.Exec("INSERT INTO etl_processed_files (data_month, filename, status) VALUES (?, ?, ?)", dataMonth, filename, status)
 	return err
 }
 
@@ -192,7 +240,7 @@ func (m *MySQLDriver) InsertBatch(table schema.TableSpec, rows [][]string) error
 		valueStrings = append(valueStrings, fmt.Sprintf("(%s)", strings.Join(placeholders, ", ")))
 	}
 
-	stmtStr := fmt.Sprintf("INSERT INTO `%s` (%s) VALUES %s", table.Name, strings.Join(cols, ", "), strings.Join(valueStrings, ", "))
+	stmtStr := fmt.Sprintf("INSERT IGNORE INTO `%s` (%s) VALUES %s", table.Name, strings.Join(cols, ", "), strings.Join(valueStrings, ", "))
 
 	if _, err := tx.Exec(stmtStr, valueArgs...); err != nil {
 		return fmt.Errorf("bulk insert error in table %s: %w", table.Name, err)

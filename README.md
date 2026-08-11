@@ -15,7 +15,7 @@ Engine de alta performance desenvolvida em **Go (Golang)** para download, descom
 - **Alta Performance**: Utiliza Goroutines e Worker Pools para realizar downloads e importações paralelas.
 - **Baixíssimo Consumo de Memória (Stream Processing)**: Lê e extrai arquivos `.zip` e faz o *parsing* de arquivos `.csv` sem carregar o dataset inteiro na RAM.
 - **Suporte Multi-Banco (MySQL & PostgreSQL)**: Alternância transparente entre MySQL e PostgreSQL via configuração `.env`.
-- **Rotina Mensal Automática**: Verifica automaticamente no servidor da Receita Federal a presença de uma nova competência mensal (`YYYY-MM`) e realiza a carga apenas quando há atualização.
+- **Rotina Diária Automática**: Verifica automaticamente no servidor da Receita Federal a presença de novos arquivos/competência diariamente (`YYYY-MM`) e realiza a carga apenas quando há dados novos.
 - **Auto-Cleanup (Exclusão Automática)**: Deleta arquivos `.zip` e `.csv` imediatamente após a confirmação da inserção no banco de dados, poupando espaço valioso de disco em servidores VPS.
 - **Pronto para Easypanel / Docker**: Auto-instalável com binário compilado estaticamente via Docker/Docker-Compose.
 
@@ -30,12 +30,13 @@ O pipeline gera e gerencia automaticamente as tabelas:
 3. `socios` (Socios, Qualificação, CPF/CNPJ Sócio, Faixa Etária)
 4. `simples` (Opção pelo Simples Nacional e MEI, Datas de Entrada/Exclusão)
 5. `cnae` (Tabela de Domínio de CNAEs)
-6. `moti` (Motivos de Situação Cadastral)
-7. `munic` (Municípios)
-8. `natju` (Naturezas Jurídicas)
-9. `pais` (Países)
-10. `quals` (Qualificações de Sócios)
+6. `motivo_situacao_cadastral` (Tabela de Domínio de Motivos de Situação Cadastral)
+7. `municipio` (Tabela de Domínio de Municípios)
+8. `natureza_juridica` (Tabela de Domínio de Naturezas Jurídicas)
+9. `pais` (Tabela de Domínio de Países)
+10. `qualificacao_socio` (Tabela de Domínio de Qualificações de Sócios)
 11. `etl_metadata` (Tabela de controle da última competência processada)
+12. `etl_processed_files` (Tabela de controle individual dos arquivos baixados e inseridos no banco)
 
 ---
 
@@ -58,7 +59,7 @@ cp .env.example .env
 | `DOWNLOAD_WORKERS` | Quantidade de threads/goroutines para download | `4` |
 | `BATCH_SIZE` | Registros por transação em lote | `5000` |
 | `AUTO_CLEANUP` | Apagar arquivos baixados/extraídos pós-importação (`true`/`false`) | `true` |
-| `CRON_SCHEDULE` | Expressão Cron para verificação mensal | `0 3 1 * *` |
+| `CRON_SCHEDULE` | Expressão Cron para verificação diária | `0 3 * * *` |
 | `RUN_ONCE` | Se `true`, executa o pipeline uma única vez e encerra | `false` |
 
 ---
