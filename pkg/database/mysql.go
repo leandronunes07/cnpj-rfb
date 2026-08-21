@@ -1,22 +1,33 @@
 package database
 
 import (
+	"bytes"
 	"database/sql"
 	"fmt"
+	"io"
 	"log"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
+	mysqldriver "github.com/go-sql-driver/mysql"
 	"github.com/leandronunes07/cnpj-rfb/pkg/config"
 	"github.com/leandronunes07/cnpj-rfb/pkg/schema"
-	_ "github.com/go-sql-driver/mysql"
 )
 
 type MySQLDriver struct {
 	cfg *config.Config
 	db  *sql.DB
+
+	// loadDataUnavailable latches to true the first time the server rejects
+	// LOAD DATA LOCAL INFILE (e.g. local_infile=0). Once set, subsequent
+	// batches skip straight to the slower INSERT IGNORE fallback instead of
+	// repeatedly retrying and failing against a server that will never allow it.
+	loadDataUnavailable atomic.Bool
 }
+
+var loadDataHandlerSeq int64
 
 func NewMySQLDriver(cfg *config.Config) *MySQLDriver {
 	return &MySQLDriver{cfg: cfg}
@@ -224,6 +235,70 @@ func (m *MySQLDriver) InsertBatch(table schema.TableSpec, rows [][]string) error
 		return nil
 	}
 
+	if !m.loadDataUnavailable.Load() {
+		err := m.insertBatchLoadData(table, rows)
+		if err == nil {
+			return nil
+		}
+		if !isLocalInfileDisabledErr(err) {
+			return err
+		}
+		m.loadDataUnavailable.Store(true)
+		log.Printf("[MySQL] AVISO: LOAD DATA LOCAL INFILE indisponível no servidor (%v). Caindo para o modo INSERT IGNORE em lote (mais lento) pelo restante da execução. Para acelerar, habilite `local_infile=1` no servidor MySQL.", err)
+	}
+
+	return m.insertBatchInsertIgnore(table, rows)
+}
+
+// insertBatchLoadData bulk-loads rows via MySQL's native LOAD DATA LOCAL
+// INFILE using a driver-registered in-memory Reader (no temp file touches
+// disk). This is dramatically faster than a batched multi-row INSERT because
+// it uses MySQL's dedicated bulk-load path instead of parsing/executing a
+// large INSERT statement. "IGNORE" preserves the same idempotency semantics
+// as the INSERT IGNORE fallback: rows colliding with an existing primary key
+// are silently skipped.
+func (m *MySQLDriver) insertBatchLoadData(table schema.TableSpec, rows [][]string) error {
+	var buf bytes.Buffer
+	for _, row := range rows {
+		for cIdx, col := range table.Columns {
+			if cIdx > 0 {
+				buf.WriteByte('\t')
+			}
+			var val string
+			if cIdx < len(row) {
+				val = row[cIdx]
+			}
+			buf.WriteString(formatValueForLoadData(val, col.Type))
+		}
+		buf.WriteByte('\n')
+	}
+	data := buf.Bytes()
+
+	handlerName := fmt.Sprintf("cnpjrbf_%s_%d_%d", table.Name, time.Now().UnixNano(), atomic.AddInt64(&loadDataHandlerSeq, 1))
+	mysqldriver.RegisterReaderHandler(handlerName, func() io.Reader {
+		return bytes.NewReader(data)
+	})
+	defer mysqldriver.DeregisterReaderHandler(handlerName)
+
+	cols := make([]string, len(table.Columns))
+	for i, c := range table.Columns {
+		cols[i] = fmt.Sprintf("`%s`", c.Name)
+	}
+
+	query := fmt.Sprintf(
+		"LOAD DATA LOCAL INFILE 'Reader::%s' IGNORE INTO TABLE `%s` CHARACTER SET utf8mb4 FIELDS TERMINATED BY '\\t' ESCAPED BY '\\\\' LINES TERMINATED BY '\\n' (%s)",
+		handlerName, table.Name, strings.Join(cols, ","),
+	)
+
+	if _, err := m.db.Exec(query); err != nil {
+		return fmt.Errorf("load data infile error in table %s: %w", table.Name, err)
+	}
+	return nil
+}
+
+// insertBatchInsertIgnore is the original batched multi-row INSERT IGNORE
+// path, kept as a fallback for MySQL servers with local_infile disabled.
+func (m *MySQLDriver) insertBatchInsertIgnore(table schema.TableSpec, rows [][]string) error {
 	tx, err := m.db.Begin()
 	if err != nil {
 		return fmt.Errorf("failed starting mysql transaction: %w", err)
@@ -260,6 +335,70 @@ func (m *MySQLDriver) InsertBatch(table schema.TableSpec, rows [][]string) error
 	}
 
 	return tx.Commit()
+}
+
+// formatValueForLoadData renders a raw CSV field as a LOAD DATA text-format
+// value, mirroring sanitizeValueMySQL's semantics: an empty/unparsable value
+// becomes SQL NULL ("\N" in LOAD DATA's text format), everything else is
+// escaped so literal tabs/newlines/backslashes in the data can't be mistaken
+// for field/line terminators.
+func formatValueForLoadData(val string, colType string) string {
+	val = strings.TrimSpace(val)
+	if val == "" {
+		return `\N`
+	}
+	if colType == "NUMERIC" {
+		val = strings.ReplaceAll(val, ",", ".")
+		if _, err := strconv.ParseFloat(val, 64); err != nil {
+			return `\N`
+		}
+		return escapeForLoadData(val)
+	}
+	if colType == "INTEGER" {
+		if _, err := strconv.Atoi(val); err != nil {
+			return `\N`
+		}
+		return escapeForLoadData(val)
+	}
+	return escapeForLoadData(val)
+}
+
+func escapeForLoadData(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range s {
+		switch r {
+		case '\\':
+			b.WriteString(`\\`)
+		case '\t':
+			b.WriteString(`\t`)
+		case '\n':
+			b.WriteString(`\n`)
+		case '\r':
+			b.WriteString(`\r`)
+		case 0:
+			b.WriteString(`\0`)
+		default:
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+// isLocalInfileDisabledErr detects the server-side rejection of LOAD DATA
+// LOCAL INFILE (MySQL error 1148), which happens when the server's
+// local_infile system variable is off. Any other error is treated as a real
+// failure and propagated instead of triggering the fallback, so genuine bugs
+// aren't silently masked.
+func isLocalInfileDisabledErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "1148") ||
+		strings.Contains(msg, "local_infile") ||
+		strings.Contains(msg, "local infile") ||
+		strings.Contains(msg, "not allowed with this mysql")
 }
 
 func (m *MySQLDriver) GetCNPJ(cleanCNPJ string) (map[string]interface{}, error) {
