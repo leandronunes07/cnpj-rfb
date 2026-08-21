@@ -110,7 +110,7 @@ document.addEventListener('DOMContentLoaded', () => {
         const data = await res.json();
         updateStats(data.stats);
         hideModal();
-        startSSE();
+        startSSE(token);
         return true;
       }
     } catch (err) {
@@ -127,8 +127,8 @@ document.addEventListener('DOMContentLoaded', () => {
     ultimaCompetencia.textContent = stats.ultima_competencia || 'Pendente';
   }
 
-  function startSSE() {
-    const sse = new EventSource('/api/v1/events');
+  function startSSE(token) {
+    const sse = new EventSource('/api/v1/events?token=' + encodeURIComponent(token));
     sse.onmessage = (event) => {
       appendLog(event.data);
     };

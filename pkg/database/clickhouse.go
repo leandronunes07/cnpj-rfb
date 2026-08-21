@@ -93,7 +93,10 @@ func (c *ClickHouseDriver) InitSchema() error {
 			primaryKey = t.Columns[0].Name
 		}
 
-		ddl := fmt.Sprintf("CREATE TABLE IF NOT EXISTS %s (%s) ENGINE = MergeTree() ORDER BY %s;",
+		// ReplacingMergeTree dedupes rows sharing the same ORDER BY key on merge/FINAL,
+		// since ClickHouse has no unique constraint and reprocessing a file would
+		// otherwise duplicate every row (plain MergeTree has no dedupe semantics).
+		ddl := fmt.Sprintf("CREATE TABLE IF NOT EXISTS %s (%s) ENGINE = ReplacingMergeTree() ORDER BY %s;",
 			t.Name, strings.Join(colDefs, ", "), primaryKey)
 
 		if _, err := c.db.Exec(ddl); err != nil {
@@ -207,7 +210,7 @@ func (c *ClickHouseDriver) GetCNPJ(cleanCNPJ string) (map[string]interface{}, er
 		e.correio_eletronico,
 		s.opcao_pelo_simples,
 		s.opcao_mei
-	FROM estabelecimento e
+	FROM estabelecimento e FINAL
 	LEFT JOIN empresa emp ON e.cnpj_basico = emp.cnpj_basico
 	LEFT JOIN simples s ON e.cnpj_basico = s.cnpj_basico
 	WHERE e.cnpj_basico = ? AND e.cnpj_ordem = ? AND e.cnpj_dv = ?
@@ -271,7 +274,7 @@ func (c *ClickHouseDriver) SearchCNPJ(query string, uf string, limit int) ([]map
 		e.nome_fantasia,
 		e.uf,
 		e.cnae_fiscal_principal
-	FROM estabelecimento e
+	FROM estabelecimento e FINAL
 	LEFT JOIN empresa emp ON e.cnpj_basico = emp.cnpj_basico
 	%s
 	LIMIT %d;`, whereClause, limit)
@@ -303,9 +306,9 @@ func (c *ClickHouseDriver) SearchCNPJ(query string, uf string, limit int) ([]map
 func (c *ClickHouseDriver) GetStats() (map[string]interface{}, error) {
 	var totalEmpresas, totalEstab, totalSocios int64
 
-	_ = c.db.QueryRow("SELECT count() FROM empresa").Scan(&totalEmpresas)
-	_ = c.db.QueryRow("SELECT count() FROM estabelecimento").Scan(&totalEstab)
-	_ = c.db.QueryRow("SELECT count() FROM socios").Scan(&totalSocios)
+	_ = c.db.QueryRow("SELECT count() FROM empresa FINAL").Scan(&totalEmpresas)
+	_ = c.db.QueryRow("SELECT count() FROM estabelecimento FINAL").Scan(&totalEstab)
+	_ = c.db.QueryRow("SELECT count() FROM socios FINAL").Scan(&totalSocios)
 
 	latestMonth, _ := c.GetLatestProcessedMonth()
 

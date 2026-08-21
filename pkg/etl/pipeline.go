@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/leandronunes07/cnpj-rfb/pkg/config"
@@ -23,19 +24,30 @@ type Pipeline struct {
 	crawler    *crawler.ReceitaCrawler
 	downloader *downloader.Downloader
 	extractor  *extractor.Extractor
+	running    atomic.Bool
 }
 
 func NewPipeline(cfg *config.Config, db database.DBDriver) *Pipeline {
+	rc := crawler.NewReceitaCrawler(cfg.BaseURL)
 	return &Pipeline{
 		cfg:        cfg,
 		db:         db,
-		crawler:    crawler.NewReceitaCrawler(cfg.BaseURL),
-		downloader: downloader.NewDownloader(cfg.DownloadWorkers),
+		crawler:    rc,
+		downloader: downloader.NewDownloader(cfg.DownloadWorkers, rc.Token),
 		extractor:  extractor.NewExtractor(),
 	}
 }
 
+// Run executes the ETL pipeline. It refuses to run concurrently with itself:
+// only one of the boot goroutine, the cron scheduler, and manual API triggers
+// can be importing data at any given time.
 func (p *Pipeline) Run() error {
+	if !p.running.CompareAndSwap(false, true) {
+		log.Println("[ETL Pipeline] Execução já em andamento, ignorando novo disparo concorrente.")
+		return fmt.Errorf("pipeline já está em execução")
+	}
+	defer p.running.Store(false)
+
 	log.Println("==================================================================")
 	log.Println("[ETL Pipeline] Iniciando rotina de verificação e carga de dados CNPJ")
 	log.Println("==================================================================")

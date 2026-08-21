@@ -27,9 +27,11 @@ func NewDBDriver(cfg *config.Config) (DBDriver, error) {
 		return NewPostgresDriver(cfg), nil
 	case "mysql":
 		return NewMySQLDriver(cfg), nil
-	case "sqlite", "turso":
+	case "sqlite":
 		return NewSQLiteDriver(cfg), nil
-	case "duckdb":
+	case "turso", "duckdb":
+		// NOTE: no native Turso/libSQL or DuckDB client is wired in yet.
+		// Both currently fall back to a local SQLite file (see duckdb.go).
 		return NewDuckDBDriver(cfg), nil
 	case "clickhouse":
 		return NewClickHouseDriver(cfg), nil

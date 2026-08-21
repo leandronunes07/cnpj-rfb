@@ -9,5 +9,7 @@ data/
 *.tmp
 
 # Binaries
-cnpj-etl
+/bin/
+/cnpj-etl
+/cnpj-etl.exe
 *.exe

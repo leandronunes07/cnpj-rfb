@@ -34,7 +34,7 @@ func (s *Server) Start() error {
 	mux.HandleFunc("/api/v1/busca", handler.AuthMiddleware(handler.HandleSearch))
 	mux.HandleFunc("/api/v1/status", handler.AuthMiddleware(handler.HandleStatus))
 	mux.HandleFunc("/api/v1/trigger-etl", handler.AuthMiddleware(handler.HandleTriggerETL))
-	mux.HandleFunc("/api/v1/events", GlobalBroadcaster.ServeHTTP)
+	mux.HandleFunc("/api/v1/events", handler.AuthMiddleware(GlobalBroadcaster.ServeHTTP))
 
 	// Web Dashboard Static UI (Embedded HTML/CSS/JS)
 	mux.Handle("/", web.StaticHandler())

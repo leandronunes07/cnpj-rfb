@@ -86,7 +86,7 @@ func LoadConfig() (*Config, error) {
 		DBSSLMode:       getEnv("DB_SSLMODE", "disable"),
 		DBFile:          filepath.Clean(dbFile),
 		APIPort:         getEnvAsInt("API_PORT", 8080),
-		APIToken:        getEnv("API_TOKEN", "taruga_secret_token_2026"),
+		APIToken:        getEnv("API_TOKEN", ""),
 		OutputDir:       filepath.Clean(outputDir),
 		ExtractedDir:    filepath.Clean(extractedDir),
 		BaseURL:         baseURL,
@@ -96,6 +96,15 @@ func LoadConfig() (*Config, error) {
 		AutoCleanup:     getEnvAsBool("AUTO_CLEANUP", true),
 		CronSchedule:    getEnv("CRON_SCHEDULE", "0 3 * * *"),
 		RunOnce:         getEnvAsBool("RUN_ONCE", false),
+	}
+
+	if cfg.APIToken == "" {
+		return nil, fmt.Errorf("API_TOKEN não configurado: defina uma variável de ambiente API_TOKEN com um valor forte e secreto antes de iniciar a aplicação")
+	}
+
+	networkedDrivers := map[string]bool{"postgres": true, "mysql": true, "clickhouse": true}
+	if networkedDrivers[dbDriver] && cfg.DBPassword == "" {
+		return nil, fmt.Errorf("DB_PASSWORD não configurado: obrigatório para o driver %q", dbDriver)
 	}
 
 	return cfg, nil

@@ -10,7 +10,7 @@ import (
 
 	"github.com/leandronunes07/cnpj-rfb/pkg/config"
 	"github.com/leandronunes07/cnpj-rfb/pkg/schema"
-	_ "github.com/lib/pq"
+	"github.com/lib/pq"
 )
 
 type PostgresDriver struct {
@@ -32,10 +32,12 @@ func (p *PostgresDriver) Connect() error {
 	if err == nil {
 		defer adminDB.Close()
 		var exists bool
-		queryCheck := fmt.Sprintf("SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname = '%s')", p.cfg.DBName)
-		if err := adminDB.QueryRow(queryCheck).Scan(&exists); err == nil && !exists {
+		err := adminDB.QueryRow("SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname = $1)", p.cfg.DBName).Scan(&exists)
+		if err == nil && !exists {
 			log.Printf("[PostgreSQL] Criando banco de dados '%s' automaticamente...", p.cfg.DBName)
-			_, _ = adminDB.Exec(fmt.Sprintf("CREATE DATABASE %s", p.cfg.DBName))
+			if _, err := adminDB.Exec(fmt.Sprintf("CREATE DATABASE %s", pq.QuoteIdentifier(p.cfg.DBName))); err != nil {
+				log.Printf("[PostgreSQL] Warning: falha ao criar banco '%s' automaticamente: %v", p.cfg.DBName, err)
+			}
 		}
 	}
 

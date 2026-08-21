@@ -8,19 +8,20 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 )
 
 type Downloader struct {
 	Workers    int
+	AuthToken  string
 	HTTPClient *http.Client
 }
 
-func NewDownloader(workers int) *Downloader {
+func NewDownloader(workers int, authToken string) *Downloader {
 	return &Downloader{
-		Workers: workers,
+		Workers:   workers,
+		AuthToken: authToken,
 		HTTPClient: &http.Client{
 			Timeout: 2 * time.Hour, // Aumentado para 2 horas para permitir o download completo de arquivos grandes (1.5GB+) em conexões mais lentas
 			Transport: &http.Transport{
@@ -129,8 +130,8 @@ func (d *Downloader) doDownload(task DownloadTask) error {
 		return fmt.Errorf("failed to create GET request: %w", err)
 	}
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-	if strings.Contains(task.URL, "receitafederal.gov.br") {
-		req.SetBasicAuth("YggdBLfdninEJX9", "")
+	if d.AuthToken != "" {
+		req.SetBasicAuth(d.AuthToken, "")
 	}
 
 	resp, err := d.HTTPClient.Do(req)
@@ -181,8 +182,8 @@ func (d *Downloader) needsDownload(targetURL string, destPath string) bool {
 		return true
 	}
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
-	if strings.Contains(targetURL, "receitafederal.gov.br") {
-		req.SetBasicAuth("YggdBLfdninEJX9", "")
+	if d.AuthToken != "" {
+		req.SetBasicAuth(d.AuthToken, "")
 	}
 	resp, err := d.HTTPClient.Do(req)
 	if err != nil || resp.StatusCode >= 400 {
