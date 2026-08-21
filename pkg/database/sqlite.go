@@ -95,26 +95,6 @@ func (s *SQLiteDriver) InitSchema() error {
 		}
 	}
 
-	indexes := []string{
-		"CREATE INDEX IF NOT EXISTS idx_empresa_cnpj ON empresa(cnpj_basico);",
-		"CREATE INDEX IF NOT EXISTS idx_empresa_razao ON empresa(razao_social);",
-		"CREATE INDEX IF NOT EXISTS idx_estabelecimento_cnpj ON estabelecimento(cnpj_basico);",
-		"CREATE INDEX IF NOT EXISTS idx_estabelecimento_uf ON estabelecimento(uf);",
-		"CREATE INDEX IF NOT EXISTS idx_estabelecimento_municipio ON estabelecimento(municipio);",
-		"CREATE INDEX IF NOT EXISTS idx_estabelecimento_cnae ON estabelecimento(cnae_fiscal_principal);",
-		"CREATE INDEX IF NOT EXISTS idx_estabelecimento_situacao ON estabelecimento(situacao_cadastral);",
-		"CREATE INDEX IF NOT EXISTS idx_estabelecimento_fantasia ON estabelecimento(nome_fantasia);",
-		"CREATE INDEX IF NOT EXISTS idx_socios_cnpj ON socios(cnpj_basico);",
-		"CREATE INDEX IF NOT EXISTS idx_simples_cnpj ON simples(cnpj_basico);",
-		"CREATE INDEX IF NOT EXISTS idx_etl_files_month_file ON etl_processed_files(data_month, filename);",
-	}
-
-	for _, idx := range indexes {
-		if _, err := s.db.Exec(idx); err != nil {
-			log.Printf("[SQLite] Warning ao criar índice: %v", err)
-		}
-	}
-
 	createView := `
 	CREATE VIEW IF NOT EXISTS vw_cnpj_completo AS
 	SELECT 
@@ -144,6 +124,31 @@ func (s *SQLiteDriver) InitSchema() error {
 	}
 
 	log.Println("[SQLite] DDL, Schemas e Views inicializados com sucesso.")
+	return nil
+}
+
+func (s *SQLiteDriver) EnsureIndexes() error {
+	indexes := []string{
+		"CREATE INDEX IF NOT EXISTS idx_empresa_cnpj ON empresa(cnpj_basico);",
+		"CREATE INDEX IF NOT EXISTS idx_empresa_razao ON empresa(razao_social);",
+		"CREATE INDEX IF NOT EXISTS idx_estabelecimento_cnpj ON estabelecimento(cnpj_basico);",
+		"CREATE INDEX IF NOT EXISTS idx_estabelecimento_uf ON estabelecimento(uf);",
+		"CREATE INDEX IF NOT EXISTS idx_estabelecimento_municipio ON estabelecimento(municipio);",
+		"CREATE INDEX IF NOT EXISTS idx_estabelecimento_cnae ON estabelecimento(cnae_fiscal_principal);",
+		"CREATE INDEX IF NOT EXISTS idx_estabelecimento_situacao ON estabelecimento(situacao_cadastral);",
+		"CREATE INDEX IF NOT EXISTS idx_estabelecimento_fantasia ON estabelecimento(nome_fantasia);",
+		"CREATE INDEX IF NOT EXISTS idx_socios_cnpj ON socios(cnpj_basico);",
+		"CREATE INDEX IF NOT EXISTS idx_simples_cnpj ON simples(cnpj_basico);",
+		"CREATE INDEX IF NOT EXISTS idx_etl_files_month_file ON etl_processed_files(data_month, filename);",
+	}
+
+	log.Println("[SQLite] Garantindo índices secundários...")
+	for _, idx := range indexes {
+		if _, err := s.db.Exec(idx); err != nil {
+			log.Printf("[SQLite] Warning ao criar índice: %v", err)
+		}
+	}
+	log.Println("[SQLite] Índices secundários prontos.")
 	return nil
 }
 

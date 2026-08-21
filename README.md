@@ -12,7 +12,7 @@ Engine de alta performance desenvolvida em **Go (Golang)** para download, descom
 
 ## 🔥 Por que escolher esta versão em Go?
 
-- **Alta Performance**: Utiliza Goroutines e Worker Pools para realizar downloads e importações paralelas.
+- **Alta Performance**: Utiliza Goroutines e Worker Pools para realizar downloads **e importações** em paralelo (cada worker processa o arquivo que baixou, sem lock global), e adia a criação de índices secundários para depois da carga em massa — evitando manutenção de índice a cada `INSERT` durante o backfill inicial.
 - **Baixíssimo Consumo de Memória (Stream Processing)**: Lê e extrai arquivos `.zip` e faz o *parsing* de arquivos `.csv` sem carregar o dataset inteiro na RAM.
 - **Suporte Multi-Banco (PostgreSQL, MySQL, SQLite, ClickHouse)**: Alternância transparente via `DB_DRIVER` no `.env`. As opções `turso` e `duckdb` também existem, mas hoje são apenas um alias do driver SQLite local (não há cliente nativo Turso/libSQL nem DuckDB implementado ainda) — não as configure esperando o comportamento real desses bancos.
 - **Rotina Diária Automática**: Verifica automaticamente no servidor da Receita Federal a presença de novos arquivos/competência diariamente (`YYYY-MM`) e realiza a carga apenas quando há dados novos.
@@ -57,8 +57,8 @@ cp .env.example .env
 | `DB_PASSWORD` | Senha do banco de dados. **Obrigatória** para `postgres`, `mysql` e `clickhouse` — a aplicação não inicia sem ela | — |
 | `DB_NAME` | Nome do banco de dados | `cnpj` |
 | `API_TOKEN` | Token de autenticação da API REST/Dashboard. **Obrigatório** — gere um valor forte, ex.: `openssl rand -hex 32` | — |
-| `DOWNLOAD_WORKERS` | Quantidade de threads/goroutines para download | `4` |
-| `BATCH_SIZE` | Registros por transação em lote | `5000` |
+| `DOWNLOAD_WORKERS` | Quantidade de goroutines paralelas para download **e** importação (cada worker descompacta/importa o arquivo que ele mesmo baixou) | `4` |
+| `BATCH_SIZE` | Teto de registros por transação em lote (o valor efetivo por tabela é `min(BATCH_SIZE, limite_de_placeholders / nº colunas)`) | `10000` |
 | `AUTO_CLEANUP` | Apagar arquivos baixados/extraídos pós-importação (`true`/`false`) | `true` |
 | `CRON_SCHEDULE` | Expressão Cron para verificação diária | `0 3 * * *` |
 | `RUN_ONCE` | Se `true`, executa o pipeline uma única vez e encerra | `false` |

@@ -6,7 +6,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -87,6 +86,9 @@ func (p *Pipeline) Run() error {
 	if len(pendingZipFiles) == 0 {
 		log.Printf("[ETL Pipeline] Todos os %d arquivos da competência %s já foram processados. Nenhuma ação necessária.", len(zipFiles), targetMonth)
 		_ = p.db.SaveProcessedMonth(targetMonth)
+		if err := p.db.EnsureIndexes(); err != nil {
+			log.Printf("[ETL Pipeline] Warning ao garantir índices: %v", err)
+		}
 		return nil
 	}
 
@@ -108,17 +110,20 @@ func (p *Pipeline) Run() error {
 		})
 	}
 
-	// Download & Stream Load Phase (Intercalado)
+	// Download & Stream Load Phase (Intercalado).
+	// Cada worker do downloader processa (descompacta + importa) o arquivo que
+	// ele mesmo baixou, sem lock global: como cada arquivo vai para sua própria
+	// subpasta de extração e cada InsertBatch abre sua própria transação, até
+	// DOWNLOAD_WORKERS arquivos podem ser importados em paralelo com segurança
+	// (bancos com múltiplas conexões escalam; SQLite, limitado a 1 conexão,
+	// naturalmente serializa via o pool sem precisar de lock explícito aqui).
 	startTime := time.Now()
-	var importMu sync.Mutex
 
 	err = p.downloader.DownloadStream(tasks, func(task downloader.DownloadTask) error {
-		importMu.Lock()
-		defer importMu.Unlock()
-
 		log.Printf("[ETL Pipeline] Processando imediatamente arquivo baixado: %s", task.Filename)
 
-		extractedFiles, err := p.extractor.ExtractZip(task.DestPath, p.cfg.ExtractedDir)
+		taskExtractDir := filepath.Join(p.cfg.ExtractedDir, strings.TrimSuffix(task.Filename, filepath.Ext(task.Filename)))
+		extractedFiles, err := p.extractor.ExtractZip(task.DestPath, taskExtractDir)
 		if err != nil {
 			log.Printf("[ETL Pipeline] ERRO ao descompactar %s: %v", task.Filename, err)
 			return nil
@@ -131,7 +136,6 @@ func (p *Pipeline) Run() error {
 			tableSpec := matchTableSpec(baseName)
 			if tableSpec == nil {
 				log.Printf("[ETL Pipeline] Nenhum schema correspondente para arquivo %s (ignorado).", baseName)
-				_ = os.Remove(extFile)
 				continue
 			}
 
@@ -141,18 +145,13 @@ func (p *Pipeline) Run() error {
 				log.Printf("[ETL Pipeline] ERRO ao importar %s para `%s`: %v", baseName, tableSpec.Name, err)
 				fileImportSuccess = false
 			}
-
-			// Clean up extracted file immediately
-			if p.cfg.AutoCleanup {
-				_ = os.Remove(extFile)
-				log.Printf("[Auto-Cleanup] Arquivo extraído removido: %s", baseName)
-			}
 		}
 
-		// Clean up zip file immediately
+		// Clean up extracted dir + zip file immediately
 		if p.cfg.AutoCleanup {
+			_ = os.RemoveAll(taskExtractDir)
 			_ = os.Remove(task.DestPath)
-			log.Printf("[Auto-Cleanup] Arquivo ZIP removido: %s", task.Filename)
+			log.Printf("[Auto-Cleanup] Arquivos extraídos e ZIP removidos: %s", task.Filename)
 		}
 
 		if matchedCount > 0 && fileImportSuccess {
@@ -170,6 +169,12 @@ func (p *Pipeline) Run() error {
 
 	if err != nil {
 		return fmt.Errorf("falha no pipeline de download e carga: %w", err)
+	}
+
+	// Build secondary indexes now that the bulk load is done, instead of
+	// maintaining them on every single insert during the load above.
+	if err := p.db.EnsureIndexes(); err != nil {
+		log.Printf("[ETL Pipeline] Warning ao garantir índices: %v", err)
 	}
 
 	// Record success in etl_metadata

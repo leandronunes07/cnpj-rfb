@@ -1,8 +1,10 @@
 package database
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 
 	"github.com/leandronunes07/cnpj-rfb/pkg/config"
@@ -98,6 +100,52 @@ func TestInsertBatchIsIdempotentOnPrimaryKey(t *testing.T) {
 	}
 	if count != 1 {
 		t.Errorf("expected exactly 1 row after reinserting the same primary key, got %d", count)
+	}
+}
+
+// The ETL pipeline now runs up to DOWNLOAD_WORKERS files through
+// InsertBatch concurrently (no global import lock). *sql.DB is safe for
+// concurrent use, and SQLite's single-connection pool just serializes the
+// concurrent transactions, so this must complete without errors, deadlocks,
+// or lost rows regardless of driver.
+func TestInsertBatchConcurrentCallsAreSafe(t *testing.T) {
+	driver := newTestSQLiteDriver(t)
+	table := findEmpresaTable(t)
+
+	const workers = 8
+	const rowsPerWorker = 25
+
+	var wg sync.WaitGroup
+	errCh := make(chan error, workers)
+
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			var rows [][]string
+			for r := 0; r < rowsPerWorker; r++ {
+				cnpj := fmt.Sprintf("%02d%06d", workerID, r)
+				rows = append(rows, []string{cnpj, "EMPRESA CONCORRENTE LTDA", "2062", "50", "100,00", "5", ""})
+			}
+			if err := driver.InsertBatch(table, rows); err != nil {
+				errCh <- err
+			}
+		}(w)
+	}
+
+	wg.Wait()
+	close(errCh)
+
+	for err := range errCh {
+		t.Errorf("concurrent InsertBatch failed: %v", err)
+	}
+
+	var count int
+	if err := driver.db.QueryRow("SELECT COUNT(*) FROM empresa").Scan(&count); err != nil {
+		t.Fatalf("failed counting rows: %v", err)
+	}
+	if count != workers*rowsPerWorker {
+		t.Errorf("expected %d rows from concurrent inserts, got %d", workers*rowsPerWorker, count)
 	}
 }
 

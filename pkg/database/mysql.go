@@ -36,7 +36,10 @@ func (m *MySQLDriver) Connect() error {
 	}
 
 	dsn := fmt.Sprintf(
-		"%s:%s@tcp(%s:%d)/%s?parseTime=true&multiStatements=true",
+		// interpolateParams evita o round-trip extra de prepared statement
+		// (COM_STMT_PREPARE + COM_STMT_EXECUTE) em cada INSERT em lote,
+		// enviando a query já com os valores interpolados client-side.
+		"%s:%s@tcp(%s:%d)/%s?parseTime=true&multiStatements=true&interpolateParams=true",
 		m.cfg.DBUser, m.cfg.DBPassword, m.cfg.DBHost, m.cfg.DBPort, m.cfg.DBName,
 	)
 
@@ -122,27 +125,6 @@ func (m *MySQLDriver) InitSchema() error {
 		}
 	}
 
-	indexes := []map[string]string{
-		{"table": "empresa", "name": "idx_empresa_cnpj", "col": "cnpj_basico"},
-		{"table": "empresa", "name": "idx_empresa_razao", "col": "razao_social(100)"},
-		{"table": "estabelecimento", "name": "idx_estabelecimento_cnpj", "col": "cnpj_basico"},
-		{"table": "estabelecimento", "name": "idx_estabelecimento_uf", "col": "uf"},
-		{"table": "estabelecimento", "name": "idx_estabelecimento_municipio", "col": "municipio"},
-		{"table": "estabelecimento", "name": "idx_estabelecimento_cnae", "col": "cnae_fiscal_principal"},
-		{"table": "estabelecimento", "name": "idx_estabelecimento_situacao", "col": "situacao_cadastral"},
-		{"table": "estabelecimento", "name": "idx_estabelecimento_fantasia", "col": "nome_fantasia(100)"},
-		{"table": "socios", "name": "idx_socios_cnpj", "col": "cnpj_basico"},
-		{"table": "simples", "name": "idx_simples_cnpj", "col": "cnpj_basico"},
-		{"table": "etl_processed_files", "name": "idx_etl_files_month_file", "col": "data_month, filename"},
-	}
-
-	for _, idx := range indexes {
-		sqlStr := fmt.Sprintf("CREATE INDEX %s ON %s(%s);", idx["name"], idx["table"], idx["col"])
-		if _, err := m.db.Exec(sqlStr); err != nil {
-			// Ignore if index exists
-		}
-	}
-
 	createView := `
 	CREATE OR REPLACE VIEW vw_cnpj_completo AS
 	SELECT 
@@ -172,6 +154,37 @@ func (m *MySQLDriver) InitSchema() error {
 	}
 
 	log.Println("[MySQL] DDL, Schemas e Views inicializados com sucesso.")
+	return nil
+}
+
+// EnsureIndexes creates secondary indexes if missing. MySQL's CREATE INDEX has
+// no IF NOT EXISTS clause, so a "duplicate key name" error on a re-run is
+// expected and logged at debug level rather than treated as a failure.
+func (m *MySQLDriver) EnsureIndexes() error {
+	indexes := []map[string]string{
+		{"table": "empresa", "name": "idx_empresa_cnpj", "col": "cnpj_basico"},
+		{"table": "empresa", "name": "idx_empresa_razao", "col": "razao_social(100)"},
+		{"table": "estabelecimento", "name": "idx_estabelecimento_cnpj", "col": "cnpj_basico"},
+		{"table": "estabelecimento", "name": "idx_estabelecimento_uf", "col": "uf"},
+		{"table": "estabelecimento", "name": "idx_estabelecimento_municipio", "col": "municipio"},
+		{"table": "estabelecimento", "name": "idx_estabelecimento_cnae", "col": "cnae_fiscal_principal"},
+		{"table": "estabelecimento", "name": "idx_estabelecimento_situacao", "col": "situacao_cadastral"},
+		{"table": "estabelecimento", "name": "idx_estabelecimento_fantasia", "col": "nome_fantasia(100)"},
+		{"table": "socios", "name": "idx_socios_cnpj", "col": "cnpj_basico"},
+		{"table": "simples", "name": "idx_simples_cnpj", "col": "cnpj_basico"},
+		{"table": "etl_processed_files", "name": "idx_etl_files_month_file", "col": "data_month, filename"},
+	}
+
+	log.Println("[MySQL] Garantindo índices secundários (pode demorar na primeira carga completa)...")
+	for _, idx := range indexes {
+		sqlStr := fmt.Sprintf("CREATE INDEX %s ON %s(%s);", idx["name"], idx["table"], idx["col"])
+		if _, err := m.db.Exec(sqlStr); err != nil {
+			if !strings.Contains(err.Error(), "Duplicate key name") {
+				log.Printf("[MySQL] Warning ao criar índice %s: %v", idx["name"], err)
+			}
+		}
+	}
+	log.Println("[MySQL] Índices secundários prontos.")
 	return nil
 }
 

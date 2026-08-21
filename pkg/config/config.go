@@ -92,7 +92,7 @@ func LoadConfig() (*Config, error) {
 		BaseURL:         baseURL,
 		DataMonth:       getEnv("DATA_MONTH", ""),
 		DownloadWorkers: getEnvAsInt("DOWNLOAD_WORKERS", 4),
-		BatchSize:       getEnvAsInt("BATCH_SIZE", 5000),
+		BatchSize:       getEnvAsInt("BATCH_SIZE", 10000),
 		AutoCleanup:     getEnvAsBool("AUTO_CLEANUP", true),
 		CronSchedule:    getEnv("CRON_SCHEDULE", "0 3 * * *"),
 		RunOnce:         getEnvAsBool("RUN_ONCE", false),

@@ -116,26 +116,6 @@ func (p *PostgresDriver) InitSchema() error {
 		}
 	}
 
-	indexes := []string{
-		"CREATE INDEX IF NOT EXISTS idx_empresa_cnpj ON empresa(cnpj_basico);",
-		"CREATE INDEX IF NOT EXISTS idx_empresa_razao ON empresa(razao_social);",
-		"CREATE INDEX IF NOT EXISTS idx_estabelecimento_cnpj ON estabelecimento(cnpj_basico);",
-		"CREATE INDEX IF NOT EXISTS idx_estabelecimento_uf ON estabelecimento(uf);",
-		"CREATE INDEX IF NOT EXISTS idx_estabelecimento_municipio ON estabelecimento(municipio);",
-		"CREATE INDEX IF NOT EXISTS idx_estabelecimento_cnae ON estabelecimento(cnae_fiscal_principal);",
-		"CREATE INDEX IF NOT EXISTS idx_estabelecimento_situacao ON estabelecimento(situacao_cadastral);",
-		"CREATE INDEX IF NOT EXISTS idx_estabelecimento_fantasia ON estabelecimento(nome_fantasia);",
-		"CREATE INDEX IF NOT EXISTS idx_socios_cnpj ON socios(cnpj_basico);",
-		"CREATE INDEX IF NOT EXISTS idx_simples_cnpj ON simples(cnpj_basico);",
-		"CREATE INDEX IF NOT EXISTS idx_etl_files_month_file ON etl_processed_files(data_month, filename);",
-	}
-
-	for _, idx := range indexes {
-		if _, err := p.db.Exec(idx); err != nil {
-			log.Printf("[PostgreSQL] Warning ao criar índice: %v", err)
-		}
-	}
-
 	createView := `
 	CREATE OR REPLACE VIEW vw_cnpj_completo AS
 	SELECT 
@@ -165,6 +145,31 @@ func (p *PostgresDriver) InitSchema() error {
 	}
 
 	log.Println("[PostgreSQL] DDL, Schemas e Views inicializados com sucesso.")
+	return nil
+}
+
+func (p *PostgresDriver) EnsureIndexes() error {
+	indexes := []string{
+		"CREATE INDEX IF NOT EXISTS idx_empresa_cnpj ON empresa(cnpj_basico);",
+		"CREATE INDEX IF NOT EXISTS idx_empresa_razao ON empresa(razao_social);",
+		"CREATE INDEX IF NOT EXISTS idx_estabelecimento_cnpj ON estabelecimento(cnpj_basico);",
+		"CREATE INDEX IF NOT EXISTS idx_estabelecimento_uf ON estabelecimento(uf);",
+		"CREATE INDEX IF NOT EXISTS idx_estabelecimento_municipio ON estabelecimento(municipio);",
+		"CREATE INDEX IF NOT EXISTS idx_estabelecimento_cnae ON estabelecimento(cnae_fiscal_principal);",
+		"CREATE INDEX IF NOT EXISTS idx_estabelecimento_situacao ON estabelecimento(situacao_cadastral);",
+		"CREATE INDEX IF NOT EXISTS idx_estabelecimento_fantasia ON estabelecimento(nome_fantasia);",
+		"CREATE INDEX IF NOT EXISTS idx_socios_cnpj ON socios(cnpj_basico);",
+		"CREATE INDEX IF NOT EXISTS idx_simples_cnpj ON simples(cnpj_basico);",
+		"CREATE INDEX IF NOT EXISTS idx_etl_files_month_file ON etl_processed_files(data_month, filename);",
+	}
+
+	log.Println("[PostgreSQL] Garantindo índices secundários...")
+	for _, idx := range indexes {
+		if _, err := p.db.Exec(idx); err != nil {
+			log.Printf("[PostgreSQL] Warning ao criar índice: %v", err)
+		}
+	}
+	log.Println("[PostgreSQL] Índices secundários prontos.")
 	return nil
 }
 

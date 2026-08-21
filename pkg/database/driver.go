@@ -11,6 +11,12 @@ type DBDriver interface {
 	Connect() error
 	Close() error
 	InitSchema() error
+	// EnsureIndexes creates secondary (non-PK) indexes if they don't exist yet.
+	// It is intentionally NOT part of InitSchema: building these indexes before
+	// a bulk load makes every insert pay for index maintenance. The pipeline
+	// calls this after loading data instead, so the first full backfill writes
+	// against bare tables and indexes are built once, in bulk, at the end.
+	EnsureIndexes() error
 	GetLatestProcessedMonth() (string, error)
 	SaveProcessedMonth(month string) error
 	IsFileProcessed(dataMonth string, filename string) (bool, error)

@@ -108,6 +108,13 @@ func (c *ClickHouseDriver) InitSchema() error {
 	return nil
 }
 
+// EnsureIndexes is a no-op for ClickHouse: MergeTree's sort key (ORDER BY) is
+// its primary index and is fixed at table creation time, there are no
+// separate secondary indexes to defer here.
+func (c *ClickHouseDriver) EnsureIndexes() error {
+	return nil
+}
+
 func (c *ClickHouseDriver) GetLatestProcessedMonth() (string, error) {
 	var month string
 	err := c.db.QueryRow("SELECT data_month FROM etl_metadata ORDER BY processed_at DESC LIMIT 1").Scan(&month)
