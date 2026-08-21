@@ -152,6 +152,10 @@ func (s *SQLiteDriver) EnsureIndexes() error {
 	return nil
 }
 
+func (s *SQLiteDriver) BatchLimit(numCols int) int {
+	return placeholderBatchLimit(numCols, s.cfg.BatchSize, 32700)
+}
+
 func (s *SQLiteDriver) GetLatestProcessedMonth() (string, error) {
 	var month string
 	err := s.db.QueryRow("SELECT data_month FROM etl_metadata ORDER BY id DESC LIMIT 1").Scan(&month)

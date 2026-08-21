@@ -230,6 +230,22 @@ func (m *MySQLDriver) SaveProcessedFile(dataMonth string, filename string, statu
 	return err
 }
 
+// BatchLimit: LOAD DATA LOCAL INFILE has no placeholder ceiling (it streams
+// text, not bound `?` params), so while it's available we let BatchSize
+// control the row count directly instead of dividing it down by column
+// count like the placeholder-bound drivers. If LOAD DATA has been disabled
+// by the server, fall back to the same placeholder-safe limit Postgres/
+// SQLite use, since insertBatchInsertIgnore takes over at that point.
+func (m *MySQLDriver) BatchLimit(numCols int) int {
+	if m.loadDataUnavailable.Load() {
+		return placeholderBatchLimit(numCols, m.cfg.BatchSize, 65000)
+	}
+	if m.cfg.BatchSize <= 0 {
+		return 10000
+	}
+	return m.cfg.BatchSize
+}
+
 func (m *MySQLDriver) InsertBatch(table schema.TableSpec, rows [][]string) error {
 	if len(rows) == 0 {
 		return nil
@@ -298,7 +314,30 @@ func (m *MySQLDriver) insertBatchLoadData(table schema.TableSpec, rows [][]strin
 
 // insertBatchInsertIgnore is the original batched multi-row INSERT IGNORE
 // path, kept as a fallback for MySQL servers with local_infile disabled.
+//
+// It re-chunks internally to a placeholder-safe sub-batch size regardless of
+// how many rows it's handed: the caller sizes batches assuming LOAD DATA (no
+// placeholder ceiling) up front, so if the LOAD DATA fallback triggers mid-
+// file, the batch already in flight can be far bigger than a single INSERT
+// statement can safely hold.
 func (m *MySQLDriver) insertBatchInsertIgnore(table schema.TableSpec, rows [][]string) error {
+	safeLimit := placeholderBatchLimit(len(table.Columns), m.cfg.BatchSize, 65000)
+	if len(rows) > safeLimit {
+		for start := 0; start < len(rows); start += safeLimit {
+			end := start + safeLimit
+			if end > len(rows) {
+				end = len(rows)
+			}
+			if err := m.insertBatchInsertIgnoreChunk(table, rows[start:end]); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	return m.insertBatchInsertIgnoreChunk(table, rows)
+}
+
+func (m *MySQLDriver) insertBatchInsertIgnoreChunk(table schema.TableSpec, rows [][]string) error {
 	tx, err := m.db.Begin()
 	if err != nil {
 		return fmt.Errorf("failed starting mysql transaction: %w", err)

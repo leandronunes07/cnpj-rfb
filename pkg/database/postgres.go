@@ -173,6 +173,10 @@ func (p *PostgresDriver) EnsureIndexes() error {
 	return nil
 }
 
+func (p *PostgresDriver) BatchLimit(numCols int) int {
+	return placeholderBatchLimit(numCols, p.cfg.BatchSize, 65000)
+}
+
 func (p *PostgresDriver) GetLatestProcessedMonth() (string, error) {
 	var month string
 	err := p.db.QueryRow("SELECT data_month FROM etl_metadata ORDER BY id DESC LIMIT 1").Scan(&month)

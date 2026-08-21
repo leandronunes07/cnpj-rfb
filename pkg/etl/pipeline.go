@@ -196,19 +196,9 @@ func (p *Pipeline) importFileToTable(filePath string, table schema.TableSpec) er
 	var batch [][]string
 	totalRows := 0
 
-	// Dinamiza o tamanho do batch para evitar limite de placeholders (65535 no MySQL/Postgres)
-	maxPlaceholders := 65000
-	if p.cfg.DBDriver == "sqlite" {
-		maxPlaceholders = 32700 // SQLite modern limit
-	}
-
-	batchLimit := maxPlaceholders / len(table.Columns)
-	if batchLimit == 0 {
-		batchLimit = 1
-	}
-	if batchLimit > p.cfg.BatchSize {
-		batchLimit = p.cfg.BatchSize
-	}
+	// Cada driver conhece seus próprios limites (placeholders para
+	// Postgres/SQLite, ausência desse limite para LOAD DATA no MySQL, etc.)
+	batchLimit := p.db.BatchLimit(len(table.Columns))
 
 	err := p.extractor.StreamCSVRows(filePath, func(row []string) error {
 		batch = append(batch, row)

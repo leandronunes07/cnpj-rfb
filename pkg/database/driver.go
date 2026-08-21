@@ -17,6 +17,13 @@ type DBDriver interface {
 	// calls this after loading data instead, so the first full backfill writes
 	// against bare tables and indexes are built once, in bulk, at the end.
 	EnsureIndexes() error
+	// BatchLimit returns how many rows the pipeline should buffer per
+	// InsertBatch call for a table with the given number of columns. Drivers
+	// that bind rows to placeholders (Postgres/SQLite multi-row INSERT) must
+	// keep this under their placeholder ceiling; drivers without that
+	// constraint (MySQL via LOAD DATA, ClickHouse's row-by-row prepared
+	// statement) are free to return a larger, memory-bound value instead.
+	BatchLimit(numCols int) int
 	GetLatestProcessedMonth() (string, error)
 	SaveProcessedMonth(month string) error
 	IsFileProcessed(dataMonth string, filename string) (bool, error)
@@ -44,6 +51,24 @@ func NewDBDriver(cfg *config.Config) (DBDriver, error) {
 	default:
 		return nil, fmt.Errorf("driver de banco não suportado: %s", cfg.DBDriver)
 	}
+}
+
+// placeholderBatchLimit computes a safe row count for drivers that bind one
+// placeholder per cell in a multi-row INSERT (Postgres, SQLite, and MySQL's
+// INSERT-IGNORE fallback), so a single statement never exceeds the driver's
+// placeholder ceiling.
+func placeholderBatchLimit(numCols int, configuredBatchSize int, maxPlaceholders int) int {
+	if numCols <= 0 {
+		numCols = 1
+	}
+	limit := maxPlaceholders / numCols
+	if limit == 0 {
+		limit = 1
+	}
+	if configuredBatchSize > 0 && limit > configuredBatchSize {
+		limit = configuredBatchSize
+	}
+	return limit
 }
 
 func NullIfEmpty(val string) interface{} {

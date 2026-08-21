@@ -115,6 +115,17 @@ func (c *ClickHouseDriver) EnsureIndexes() error {
 	return nil
 }
 
+// BatchLimit: InsertBatch executes one prepared statement per row (not a
+// multi-row VALUES list), so there's no placeholder ceiling to respect here
+// — the limit is purely how many rows we're willing to buffer in memory and
+// commit per transaction, which is exactly what BatchSize is for.
+func (c *ClickHouseDriver) BatchLimit(numCols int) int {
+	if c.cfg.BatchSize <= 0 {
+		return 5000
+	}
+	return c.cfg.BatchSize
+}
+
 func (c *ClickHouseDriver) GetLatestProcessedMonth() (string, error) {
 	var month string
 	err := c.db.QueryRow("SELECT data_month FROM etl_metadata ORDER BY processed_at DESC LIMIT 1").Scan(&month)

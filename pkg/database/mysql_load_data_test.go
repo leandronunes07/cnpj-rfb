@@ -3,6 +3,8 @@ package database
 import (
 	"errors"
 	"testing"
+
+	"github.com/leandronunes07/cnpj-rfb/pkg/config"
 )
 
 func TestFormatValueForLoadData(t *testing.T) {
@@ -52,5 +54,34 @@ func TestIsLocalInfileDisabledErr(t *testing.T) {
 				t.Errorf("isLocalInfileDisabledErr(%v) = %v, want %v", tc.err, got, tc.want)
 			}
 		})
+	}
+}
+
+// While LOAD DATA is available it isn't placeholder-bound, so BatchLimit
+// should hand back BatchSize as-is (not divided down by column count) —
+// otherwise a wide table like estabelecimento (~30 cols) would still get
+// chopped into ~2000-row batches for no reason, defeating most of the win.
+func TestMySQLBatchLimitUsesLoadDataWhenAvailable(t *testing.T) {
+	m := &MySQLDriver{cfg: &config.Config{BatchSize: 10000}}
+
+	if got := m.BatchLimit(30); got != 10000 {
+		t.Errorf("expected BatchLimit(30) = 10000 while LOAD DATA is available, got %d", got)
+	}
+}
+
+// Once LOAD DATA has been marked unavailable (server rejected it), BatchLimit
+// must fall back to a placeholder-safe size so the INSERT IGNORE fallback
+// never builds an oversized multi-row statement.
+func TestMySQLBatchLimitFallsBackWhenLoadDataUnavailable(t *testing.T) {
+	m := &MySQLDriver{cfg: &config.Config{BatchSize: 10000}}
+	m.loadDataUnavailable.Store(true)
+
+	got := m.BatchLimit(30)
+	want := placeholderBatchLimit(30, 10000, 65000)
+	if got != want {
+		t.Errorf("expected BatchLimit(30) = %d once LOAD DATA is unavailable, got %d", want, got)
+	}
+	if got >= 10000 {
+		t.Errorf("fallback BatchLimit should be placeholder-bound (well under 10000 for 30 cols), got %d", got)
 	}
 }
