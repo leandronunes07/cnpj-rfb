@@ -14,6 +14,8 @@ document.addEventListener('DOMContentLoaded', () => {
   const ultimaCompetencia = document.getElementById('ultimaCompetencia');
 
   let apiToken = localStorage.getItem('cnpj_api_token') || '';
+  let activeSSE = null;
+  let statsIntervalId = null;
 
   if (apiToken) {
     verifyToken(apiToken);
@@ -40,6 +42,14 @@ document.addEventListener('DOMContentLoaded', () => {
   logoutBtn.addEventListener('click', () => {
     localStorage.removeItem('cnpj_api_token');
     apiToken = '';
+    if (activeSSE) {
+      activeSSE.close();
+      activeSSE = null;
+    }
+    if (statsIntervalId) {
+      clearInterval(statsIntervalId);
+      statsIntervalId = null;
+    }
     showModal();
   });
 
@@ -111,6 +121,7 @@ document.addEventListener('DOMContentLoaded', () => {
         updateStats(data.stats);
         hideModal();
         startSSE(token);
+        startStatsPolling();
         return true;
       }
     } catch (err) {
@@ -128,10 +139,43 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 
   function startSSE(token) {
+    if (activeSSE) {
+      activeSSE.close();
+    }
     const sse = new EventSource('/api/v1/events?token=' + encodeURIComponent(token));
+    activeSSE = sse;
+    sse.onopen = () => {
+      appendLog('[Sistema] Conectado ao streaming de logs em tempo real.');
+    };
     sse.onmessage = (event) => {
       appendLog(event.data);
     };
+    sse.onerror = () => {
+      // EventSource reconnects automatically; this just makes the gap
+      // visible instead of the console silently going quiet, which used to
+      // be indistinguishable from "nothing is happening".
+      appendLog('[Sistema] Conexão de logs interrompida. Tentando reconectar...');
+    };
+  }
+
+  function startStatsPolling() {
+    if (statsIntervalId) {
+      clearInterval(statsIntervalId);
+    }
+    statsIntervalId = setInterval(async () => {
+      if (!apiToken) return;
+      try {
+        const res = await fetch('/api/v1/status', {
+          headers: { 'X-API-Token': apiToken }
+        });
+        if (res.ok) {
+          const data = await res.json();
+          updateStats(data.stats);
+        }
+      } catch (err) {
+        // Silent: the next tick retries, no need to spam the log console.
+      }
+    }, 15000);
   }
 
   function appendLog(msg) {
