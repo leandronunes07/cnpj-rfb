@@ -169,6 +169,30 @@ func (p *PostgresDriver) EnsureIndexes() error {
 			log.Printf("[PostgreSQL] Warning ao criar índice: %v", err)
 		}
 	}
+
+	// SearchCNPJ runs LOWER(col) LIKE '%termo%' — a leading wildcard that a
+	// plain B-tree index can never use, so without this it's a full table
+	// scan over `estabelecimento` on every search. pg_trgm lets the planner
+	// use a GIN trigram index for that exact same LIKE query automatically,
+	// no query rewrite needed. Requires the pg_trgm contrib extension
+	// (bundled with essentially every Postgres install/managed service); if
+	// the connection lacks privilege to create it, this is logged and
+	// skipped rather than failing the whole pipeline — search just stays
+	// on the slower sequential-scan path.
+	if _, err := p.db.Exec("CREATE EXTENSION IF NOT EXISTS pg_trgm;"); err != nil {
+		log.Printf("[PostgreSQL] Warning: não foi possível habilitar a extensão pg_trgm (%v) — busca por nome continuará sem aceleração por índice.", err)
+	} else {
+		trigramIndexes := []string{
+			"CREATE INDEX IF NOT EXISTS idx_empresa_razao_trgm ON empresa USING GIN (LOWER(razao_social) gin_trgm_ops);",
+			"CREATE INDEX IF NOT EXISTS idx_estabelecimento_fantasia_trgm ON estabelecimento USING GIN (LOWER(nome_fantasia) gin_trgm_ops);",
+		}
+		for _, idx := range trigramIndexes {
+			if _, err := p.db.Exec(idx); err != nil {
+				log.Printf("[PostgreSQL] Warning ao criar índice trigram: %v", err)
+			}
+		}
+	}
+
 	log.Println("[PostgreSQL] Índices secundários prontos.")
 	return nil
 }

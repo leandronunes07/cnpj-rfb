@@ -50,6 +50,42 @@ Isso é uma configuração do **servidor** MySQL, não da aplicação — não h
 - `BATCH_SIZE` controla o tamanho do lote enviado por `LOAD DATA`; valores muito baixos (ex.: os `5000` do padrão antigo) geram mais chamadas do que o necessário. O padrão atual é `10000` — considere subir se tiver RAM sobrando.
 - Verifique `innodb_buffer_pool_size` do seu servidor MySQL — para tabelas de dezenas de milhões de linhas, um buffer pool pequeno faz o InnoDB bater em disco o tempo todo.
 
+### Aplicar os tipos de coluna otimizados (`VARCHAR`) em um banco MySQL que já está em produção
+
+Desde a versão atual, `InitSchema` cria colunas como `nome_fantasia`, `logradouro`, `bairro`, `cep`, etc. como `VARCHAR(n)` em vez de `TEXT` genérico — mas isso só vale para `CREATE TABLE IF NOT EXISTS`, ou seja, **só afeta uma instalação nova**. Um banco que já existe e já tem dados não é migrado automaticamente (de propósito: um `ALTER TABLE` de conversão de tipo numa tabela com dezenas de milhões de linhas reescreve a tabela inteira, trava escritas durante a operação, e não é algo pra rodar sozinho sem você estar olhando).
+
+Se quiser aplicar manualmente num banco existente, faça um por vez, em horário de baixo tráfego, e confira o espaço em disco disponível (a operação usa espaço extra temporário):
+
+```sql
+ALTER TABLE estabelecimento MODIFY nome_fantasia VARCHAR(60);
+ALTER TABLE estabelecimento MODIFY logradouro VARCHAR(100);
+-- repita para as demais colunas listadas em mysqlColumnTypeOverrides (pkg/database/mysql.go)
+```
+
+Isso é opcional — o banco continua funcionando normalmente com as colunas em `TEXT`, só não ganha o benefício de I/O/indexação menor.
+
+---
+
+## Busca por nome (`GET /api/v1/busca`)
+
+### A busca no MySQL não encontra um termo curto (2 caracteres) que eu sei que existe
+
+Esperado: termos com menos de 3 caracteres ficam abaixo do `innodb_ft_min_token_size` padrão do MySQL, então a aplicação detecta isso e usa automaticamente o `LIKE` original (mais lento, mas sem essa limitação) só para esses casos — veja [`docs/API.md`](API.md#como-a-busca-é-acelerada-varia-por-driver). Se mesmo assim não encontrar, o problema não é a busca — confira se a competência com aquele registro já foi carregada.
+
+### `[PostgreSQL] Warning: não foi possível habilitar a extensão pg_trgm`
+
+O usuário configurado em `DB_USER` não tem privilégio para `CREATE EXTENSION`. Em bancos gerenciados (RDS, Supabase, etc.) normalmente isso já vem liberado por padrão para extensões comuns como `pg_trgm`; se não vier, peça para alguém com privilégio de superusuário rodar uma vez:
+
+```sql
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
+```
+
+Sem isso, a busca no Postgres continua funcionando normalmente, só sem aceleração por índice (volta a ser um scan completo, igual antes).
+
+### `[MySQL] Warning ao criar índice FULLTEXT ...`
+
+Geralmente aparece se a tabela usa um engine que não suporta `FULLTEXT` (deveria ser sempre `InnoDB` aqui, gerado pelo próprio `InitSchema`) ou se a coluna já tem um índice `FULLTEXT` com configuração incompatível de uma versão anterior do schema. Enquanto esse aviso aparecer, a busca no MySQL usa automaticamente o `LIKE` original — nada quebra, só fica mais lenta.
+
 ---
 
 ## Dashboard / monitoramento

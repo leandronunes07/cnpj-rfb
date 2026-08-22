@@ -109,10 +109,29 @@ func (c *ClickHouseDriver) InitSchema() error {
 	return nil
 }
 
-// EnsureIndexes is a no-op for ClickHouse: MergeTree's sort key (ORDER BY) is
-// its primary index and is fixed at table creation time, there are no
-// separate secondary indexes to defer here.
+// EnsureIndexes adds data-skipping indexes for SearchCNPJ's name search.
+// MergeTree's sort key (ORDER BY) is the primary index and is fixed at table
+// creation time — nothing to defer there — but a plain `LIKE '%termo%'`
+// scan still has to touch every granule of `empresa`/`estabelecimento`
+// without help. An ngram bloom filter index lets ClickHouse skip granules
+// that provably can't match, without changing query semantics at all: it's
+// a MAYBE-contains filter, ClickHouse still checks matches normally, so this
+// is purely additive and safe to fail/skip on older ClickHouse versions.
 func (c *ClickHouseDriver) EnsureIndexes() error {
+	statements := []string{
+		"ALTER TABLE empresa ADD INDEX IF NOT EXISTS idx_razao_ngram lower(razao_social) TYPE ngrambf_v1(3, 256, 2, 0) GRANULARITY 4;",
+		"ALTER TABLE estabelecimento ADD INDEX IF NOT EXISTS idx_fantasia_ngram lower(nome_fantasia) TYPE ngrambf_v1(3, 256, 2, 0) GRANULARITY 4;",
+		"ALTER TABLE empresa MATERIALIZE INDEX idx_razao_ngram;",
+		"ALTER TABLE estabelecimento MATERIALIZE INDEX idx_fantasia_ngram;",
+	}
+
+	log.Println("[ClickHouse] Garantindo índices de skip para busca por nome...")
+	for _, stmt := range statements {
+		if _, err := c.db.Exec(stmt); err != nil {
+			log.Printf("[ClickHouse] Warning ao aplicar índice de skip: %v", err)
+		}
+	}
+	log.Println("[ClickHouse] Índices de skip prontos.")
 	return nil
 }
 

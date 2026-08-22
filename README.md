@@ -202,13 +202,28 @@ go run ./cmd/cnpj-etl --once    # roda o pipeline uma vez e encerra
 
 O que faz essa engine ser rápida não é um único truque, é a soma de várias decisões de arquitetura:
 
+**Carga (escrita):**
+
 - **Importação paralela, não sequencial** — até `DOWNLOAD_WORKERS` arquivos são descompactados e carregados no banco ao mesmo tempo, sem lock global entre eles.
 - **`LOAD DATA LOCAL INFILE` no MySQL** — usa o mecanismo nativo de bulk-load do MySQL em vez de `INSERT` em lote, com fallback automático e transparente se o servidor não permitir.
 - **Índices secundários adiados** — criados só depois da carga completa, não a cada `INSERT`, que é o maior fator de lentidão em uma carga em massa do zero.
 - **`ReplacingMergeTree` no ClickHouse** — dedupe em merge, sem overhead de checagem de unicidade por linha.
-- Tempo real de uma carga completa depende muito do hardware do banco e da rede até a Receita Federal — não existe número universal, mas o [guia de performance completo](docs/ARCHITECTURE.md) detalha cada decisão e como ajustar `BATCH_SIZE`/`DOWNLOAD_WORKERS` para o seu ambiente.
+- Tempo real de uma carga completa depende muito do hardware do banco e da rede até a Receita Federal — não existe número universal.
 
 Se o log do MySQL mostrar `AVISO: LOAD DATA LOCAL INFILE indisponível`, veja [Solução de problemas](#-solução-de-problemas) para destravar o modo mais rápido.
+
+**Busca (leitura):**
+
+Uma busca "contém" (`%termo%`) nunca usa índice B-tree comum — todo banco relacional esbarra nisso. Cada driver compensa à sua forma (detalhes e trade-offs de cada um em [`docs/API.md`](docs/API.md#como-a-busca-é-acelerada-varia-por-driver)):
+
+- **Postgres**: índice GIN trigram (`pg_trgm`) — acelera sem mudar nenhuma semântica de busca.
+- **MySQL**: índice `FULLTEXT` (`MATCH ... AGAINST`) — muda a semântica para busca por palavra/prefixo em vez de substring literal, com fallback automático para o `LIKE` original em termos curtos (< 3 caracteres).
+- **ClickHouse**: índice de skip `ngrambf_v1` — puramente aditivo, zero mudança de semântica.
+- **SQLite/turso/duckdb**: sem aceleração (scan completo) — aceitável dado o propósito desse driver.
+
+**Schema MySQL**: colunas curtas de formato fixo (`nome_fantasia`, `logradouro`, `cep`, etc.) usam `VARCHAR(n)` em vez de `TEXT` genérico — menor I/O, indexável de verdade. Isso só vale para instalações novas (`CREATE TABLE IF NOT EXISTS`); um banco MySQL que já está em produção não é migrado automaticamente — veja [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md#aplicar-os-tipos-de-coluna-otimizados-varchar-em-um-banco-mysql-que-já-está-em-produção) se quiser aplicar manualmente.
+
+> ⚠️ As otimizações de busca (`pg_trgm`, `FULLTEXT`, `ngrambf_v1`) foram implementadas e revisadas com cuidado, mas **não foram validadas contra um servidor MySQL/PostgreSQL/ClickHouse real** (ambiente de desenvolvimento sem acesso a um daemon Docker funcional no momento). Todas têm fallback automático e defensivo — se algo não aplicar (permissão insuficiente, versão do banco, etc.), a aplicação loga um aviso e a busca continua funcionando do jeito antigo, só sem o ganho de velocidade. Acompanhe o log na primeira execução após atualizar.
 
 ## 🩹 Solução de problemas
 
@@ -265,7 +280,10 @@ Transparência sobre o estado atual do projeto — bom pra quem quiser contribui
 - `turso` e `duckdb` são hoje apenas um alias do driver SQLite local — implementar clientes nativos de verdade é a contribuição mais valiosa que falta.
 - Há duplicação de código entre os 4 drivers de banco (`GetCNPJ`, `SearchCNPJ`, `GetStats` são quase idênticos entre eles) — funcional, mas um ponto de atenção para quem for mexer em uma query.
 - O CORS da API está aberto (`Access-Control-Allow-Origin: *`) em todos os endpoints — avaliado como baixo risco dado o esquema de autenticação por token, mas vale revisar se o seu caso de uso exigir mais restrição.
-- Sem suíte de testes de integração contra um banco real (Postgres/MySQL/ClickHouse) — os testes automatizados usam SQLite.
+- Sem suíte de testes de integração contra um banco real (Postgres/MySQL/ClickHouse) — os testes automatizados usam SQLite; as otimizações de busca por nome (`pg_trgm`/`FULLTEXT`/`ngrambf_v1`) foram revisadas manualmente com cuidado, mas não puderam ser validadas ao vivo contra um servidor real até agora (todas têm fallback automático, então na pior hipótese só perdem o ganho de velocidade, sem quebrar).
+- `SQLite`/`turso`/`duckdb` não têm nenhuma aceleração para busca por nome (`GET /api/v1/busca` faz scan completo nesses drivers) — um índice FTS5 resolveria, mas ainda não foi implementado.
+- ClickHouse usa `FINAL` nas leituras de `GetCNPJ`/`SearchCNPJ`/`GetStats` para garantir dedupe correto (ver [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)) — corrige um bug real, mas tem custo de performance na leitura em tabelas muito grandes; não foi otimizado além disso.
+- Nunca foi medido um tempo real de ponta a ponta para uma carga completa em produção — as estimativas de performance no README são por ordem de grandeza, não medição.
 
 ## 📄 Licença
 

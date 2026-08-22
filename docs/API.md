@@ -95,9 +95,20 @@ Busca por razão social / nome fantasia, com filtro opcional de UF.
 
 | Parâmetro | Obrigatório | Descrição |
 |---|---|---|
-| `q` | sim | Termo de busca (case-insensitive, `LIKE %termo%` em razão social ou nome fantasia) |
+| `q` | sim | Termo de busca (case-insensitive) em razão social ou nome fantasia |
 | `uf` | não | Sigla da UF (2 letras) para filtrar |
 | `limit` | não | Quantidade de resultados, `1`-`100`. Fora desse intervalo, usa o padrão `20` |
+
+### Como a busca é acelerada (varia por driver)
+
+Uma busca "contém" (`%termo%`, com wildcard no início) nunca consegue usar um índice B-tree comum — nenhum banco relacional escapa disso. Cada driver compensa isso à sua maneira, de forma transparente pra quem consome a API (o formato da resposta não muda):
+
+| Driver | Estratégia | Observação |
+|---|---|---|
+| `postgres` | Índice GIN trigram (`pg_trgm`) | Acelera a mesma consulta `LIKE`/`ILIKE` sem mudar nenhuma semântica — o resultado é idêntico ao de um scan completo, só mais rápido. Exige a extensão `pg_trgm` (contrib padrão, disponível em praticamente toda instalação/serviço gerenciado); se a conexão não tiver privilégio para criá-la, a aplicação loga um aviso e a busca continua funcionando, só sem aceleração. |
+| `mysql` | Índice `FULLTEXT` + `MATCH ... AGAINST` (boolean mode) | **Muda a semântica**: em vez de "contém a substring", vira "cada palavra do termo de busca, por prefixo" (`agencia` casa com "AGENCIA TARUGA", mas não casaria com "AXAGENCIAX" no meio de outra palavra). Termos com menos de 3 caracteres (limite padrão do MySQL, `innodb_ft_min_token_size`) automaticamente caem de volta para o `LIKE` original, preservando o comportamento antigo nesse caso — então a busca nunca fica "pior" que antes, só mais rápida quando possível. |
+| `clickhouse` | Índice de skip `ngrambf_v1` (bloom filter) | Não muda semântica nenhuma — é um filtro "talvez contenha" que deixa o ClickHouse pular granules inteiros que provadamente não têm match, mantendo o `LIKE` exato por baixo. |
+| `sqlite` / `turso` / `duckdb` | Nenhuma (scan completo) | Aceitável dado o propósito desse driver (desenvolvimento/testes/escala pequena); não há um equivalente leve de índice de texto no SQLite puro sem introduzir uma tabela virtual FTS5 separada, o que ainda não foi implementado. |
 
 ```bash
 curl -H "X-API-Token: $API_TOKEN" "http://localhost:8080/api/v1/busca?q=agencia+taruga&uf=MG&limit=10"
