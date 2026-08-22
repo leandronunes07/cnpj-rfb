@@ -371,6 +371,28 @@ func (s *SQLiteDriver) GetStats() (map[string]interface{}, error) {
 	}, nil
 }
 
+func (s *SQLiteDriver) GetSearchDocuments(offset, limit int) ([]SearchDocument, bool, error) {
+	query := `
+	SELECT
+		e.cnpj_basico || e.cnpj_ordem || e.cnpj_dv AS cnpj,
+		emp.razao_social,
+		e.nome_fantasia,
+		e.uf,
+		e.cnae_fiscal_principal
+	FROM estabelecimento e
+	LEFT JOIN empresa emp ON e.cnpj_basico = emp.cnpj_basico
+	ORDER BY e.cnpj_basico, e.cnpj_ordem, e.cnpj_dv
+	LIMIT ? OFFSET ?;`
+
+	rows, err := s.db.Query(query, limit+1, offset)
+	if err != nil {
+		return nil, false, err
+	}
+	defer rows.Close()
+
+	return scanSearchDocuments(rows, limit)
+}
+
 func sanitizeValueSQLite(val string, colType string) interface{} {
 	val = strings.TrimSpace(val)
 	if val == "" {

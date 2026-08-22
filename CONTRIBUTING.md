@@ -4,7 +4,7 @@ Obrigado pelo interesse em contribuir com o **CNPJ Receita Federal ETL Engine**!
 
 ## Ambiente de desenvolvimento
 
-Requisitos: Go 1.22+.
+Requisitos: Go 1.24+.
 
 ```bash
 git clone https://github.com/leandronunes07/cnpj-rfb.git

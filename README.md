@@ -8,7 +8,7 @@ Download paralelo → stream de extração → carga paralela no banco → API R
 Tudo em um único binário compilado, sem runtime, sem dependências externas.
 
 [![CI](https://img.shields.io/github/actions/workflow/status/leandronunes07/cnpj-rfb/ci.yml?branch=main&style=for-the-badge&label=CI)](https://github.com/leandronunes07/cnpj-rfb/actions/workflows/ci.yml)
-[![Go Version](https://img.shields.io/badge/Go-1.22+-00ADD8?style=for-the-badge&logo=go&logoColor=white)](https://go.dev)
+[![Go Version](https://img.shields.io/badge/Go-1.24+-00ADD8?style=for-the-badge&logo=go&logoColor=white)](https://go.dev)
 [![License: MIT](https://img.shields.io/github/license/leandronunes07/cnpj-rfb?style=for-the-badge&color=blue)](LICENSE)
 [![Docker Ready](https://img.shields.io/badge/Docker-Ready-2496ED?style=for-the-badge&logo=docker&logoColor=white)](Dockerfile)
 [![Last Commit](https://img.shields.io/github/last-commit/leandronunes07/cnpj-rfb?style=for-the-badge&color=orange)](https://github.com/leandronunes07/cnpj-rfb/commits/main)
@@ -19,6 +19,8 @@ Tudo em um único binário compilado, sem runtime, sem dependências externas.
 [![MySQL](https://img.shields.io/badge/MySQL-4479A1?logo=mysql&logoColor=white)](https://www.mysql.com)
 [![SQLite](https://img.shields.io/badge/SQLite-003B57?logo=sqlite&logoColor=white)](https://www.sqlite.org)
 [![ClickHouse](https://img.shields.io/badge/ClickHouse-FFCC01?logo=clickhouse&logoColor=black)](https://clickhouse.com)
+[![Redis](https://img.shields.io/badge/Redis-optional-DC382D?logo=redis&logoColor=white)](https://redis.io)
+[![Meilisearch](https://img.shields.io/badge/Meilisearch-optional-FF5CAA?logo=meilisearch&logoColor=white)](https://www.meilisearch.com)
 [![Docker](https://img.shields.io/badge/Docker-2496ED?logo=docker&logoColor=white)](https://www.docker.com)
 
 [Instalação rápida](#-instalação-rápida) •
@@ -67,6 +69,9 @@ O resultado prático: uma engine pensada para ser **rápida, enxuta em memória 
 - **Auto-cleanup** — apaga `.zip`/`.csv` imediatamente após confirmar a inserção, essencial em VPS com disco limitado.
 - **Dashboard web embutido** — estatísticas ao vivo, console de logs via Server-Sent Events, testador de API — tudo compilado dentro do binário (`go:embed`).
 - **API REST autenticada** — consulta de CNPJ, busca por razão social/UF, status/estatísticas, disparo manual.
+- **Lock distribuído opcional (Redis)** — se você rodar múltiplas instâncias do app, o guard de "só uma execução do pipeline por vez" passa a ser coordenado via Redis em vez de só em memória.
+- **Rate limiting opcional (Redis)** — limite de requisições por cliente na API, configurável, ativado automaticamente quando o Redis está configurado.
+- **Busca com Meilisearch opcional** — ranking de relevância e tolerância a erro de digitação na busca por nome, com fallback automático para SQL se não estiver configurado ou indisponível.
 - **Pronto para produção** — Docker, Docker Compose, Portainer, Easypanel.
 
 ## 📐 Arquitetura
@@ -81,10 +86,11 @@ Cada worker de download processa (descompacta + importa) o próprio arquivo que 
 
 ## 📋 Requisitos
 
-- **Go 1.22+** (só se for compilar/rodar localmente sem Docker)
+- **Go 1.24+** (só se for compilar/rodar localmente sem Docker)
 - **Docker + Docker Compose** (recomendado para produção)
 - Um banco de dados: PostgreSQL, MySQL, ClickHouse — **ou** nada além do disco local (SQLite)
 - Acesso de rede de saída para `arquivos.receitafederal.gov.br`
+- Redis e Meilisearch são **opcionais** — nada quebra sem eles, veja [Configuração](#-configuração-env)
 
 ## 🏁 Instalação rápida
 
@@ -99,6 +105,13 @@ docker-compose up -d --build
 ```
 
 O painel fica disponível em `http://localhost:8080` (ou a porta que você definir em `API_PORT`).
+
+Para subir Redis e Meilisearch junto (opcional — veja [Configuração](#-configuração-env)):
+
+```bash
+# defina REDIS_ADDR=redis:6379 e MEILISEARCH_HOST=http://meilisearch:7700 no .env antes
+docker-compose --profile extras up -d --build
+```
 
 ### Execução local via Go
 
@@ -145,6 +158,13 @@ cp .env.example .env
 | `AUTO_CLEANUP` | Apaga `.zip`/`.csv` logo após importar (`true`/`false`) | `true` |
 | `CRON_SCHEDULE` | Expressão cron para checagem diária | `0 3 * * *` |
 | `RUN_ONCE` | Se `true`, roda uma vez e encerra (equivalente a `--once`) | `false` |
+| `REDIS_ADDR` | Endereço `host:porta` do Redis. **Opcional** — vazio = lock do pipeline fica local e rate limiting desativado | — |
+| `REDIS_PASSWORD` | Senha do Redis, se houver | — |
+| `REDIS_DB` | Número do banco lógico do Redis | `0` |
+| `RATE_LIMIT_PER_MINUTE` | Requisições por minuto, por cliente (IP), quando `REDIS_ADDR` está configurado | `120` |
+| `MEILISEARCH_HOST` | URL do Meilisearch (ex.: `http://localhost:7700`). **Opcional** — vazio = busca por nome fica só no SQL | — |
+| `MEILISEARCH_API_KEY` | Chave de API do Meilisearch | — |
+| `MEILISEARCH_INDEX` | Nome do índice usado para a busca | `estabelecimentos` |
 
 ## 🗄️ Bancos de dados suportados
 
@@ -214,12 +234,15 @@ Se o log do MySQL mostrar `AVISO: LOAD DATA LOCAL INFILE indisponível`, veja [S
 
 **Busca (leitura):**
 
-Uma busca "contém" (`%termo%`) nunca usa índice B-tree comum — todo banco relacional esbarra nisso. Cada driver compensa à sua forma (detalhes e trade-offs de cada um em [`docs/API.md`](docs/API.md#como-a-busca-é-acelerada-varia-por-driver)):
+Uma busca "contém" (`%termo%`) nunca usa índice B-tree comum — todo banco relacional esbarra nisso. Cada driver compensa à sua forma, e o **Meilisearch (opcional)** substitui todos eles quando configurado — é a única opção com ranking de relevância e tolerância a erro de digitação de verdade. Detalhes e trade-offs de cada um em [`docs/API.md`](docs/API.md#como-a-busca-é-acelerada-varia-por-driver):
 
+- **Meilisearch** (se `MEILISEARCH_HOST` configurado): usado primeiro, sempre — ranking, typo tolerance, muito mais rápido que qualquer aceleração SQL. Reindexação completa (não incremental) roda em background depois de cada carga com dados novos.
 - **Postgres**: índice GIN trigram (`pg_trgm`) — acelera sem mudar nenhuma semântica de busca.
 - **MySQL**: índice `FULLTEXT` (`MATCH ... AGAINST`) — muda a semântica para busca por palavra/prefixo em vez de substring literal, com fallback automático para o `LIKE` original em termos curtos (< 3 caracteres).
 - **ClickHouse**: índice de skip `ngrambf_v1` — puramente aditivo, zero mudança de semântica.
-- **SQLite/turso/duckdb**: sem aceleração (scan completo) — aceitável dado o propósito desse driver.
+- **SQLite/turso/duckdb**: sem aceleração nativa (scan completo) — habilitar o Meilisearch é a forma recomendada de acelerar a busca nesses drivers.
+
+Toda resposta de `GET /api/v1/busca` inclui um campo `"source"` (`"meilisearch"` ou `"sql"`) indicando qual motor respondeu.
 
 **Schema MySQL**: colunas curtas de formato fixo (`nome_fantasia`, `logradouro`, `cep`, etc.) usam `VARCHAR(n)` em vez de `TEXT` genérico — menor I/O, indexável de verdade. Isso só vale para instalações novas (`CREATE TABLE IF NOT EXISTS`); um banco MySQL que já está em produção não é migrado automaticamente — veja [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md#aplicar-os-tipos-de-coluna-otimizados-varchar-em-um-banco-mysql-que-já-está-em-produção) se quiser aplicar manualmente.
 
@@ -233,6 +256,8 @@ Guia completo em [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md). Os mais c
 - **"DB_PASSWORD não configurado"** → obrigatório para `postgres`/`mysql`/`clickhouse`.
 - **`AVISO: LOAD DATA LOCAL INFILE indisponível`** no log do MySQL → habilite `local_infile=1` no servidor MySQL (a aplicação continua funcionando, só mais devagar, via fallback automático).
 - **Dashboard "trava" e não atualiza** → geralmente é proxy reverso (nginx/Traefik) bufferizando a conexão SSE; a aplicação já envia os headers corretos (`X-Accel-Buffering: no` + ping periódico), mas confira a configuração do seu proxy se persistir.
+- **`[Redis] AVISO: não foi possível conectar`** ou **`[Search] AVISO: não foi possível conectar no Meilisearch`** → ambos opcionais, a aplicação segue funcionando normalmente sem eles (lock local, sem rate limiting, busca só via SQL); confira o endereço/porta configurado.
+- **`429 Too Many Requests`** na API → rate limiting ativo (Redis configurado); veja o header `Retry-After` da resposta, ou ajuste `RATE_LIMIT_PER_MINUTE`.
 
 ## 🔒 Segurança
 
@@ -252,9 +277,11 @@ pkg/extractor/      extração de zip + streaming de CSV (ISO-8859-1 → UTF-8)
 pkg/schema/         definição das tabelas/colunas (usada para gerar DDL e mapear arquivo→tabela)
 pkg/database/       interface DBDriver + drivers (postgres, mysql, sqlite, clickhouse)
 pkg/etl/            orquestração do pipeline completo
-pkg/api/            servidor HTTP, autenticação, endpoints REST, broadcaster SSE
+pkg/api/            servidor HTTP, autenticação, rate limiting, endpoints REST, broadcaster SSE
 pkg/web/            dashboard estático embutido no binário (go:embed)
 pkg/scheduler/      agendador cron
+pkg/lock/           lock de execução do pipeline (local ou distribuído via Redis)
+pkg/search/         cliente Meilisearch para busca por nome (opcional)
 ```
 
 Detalhes de cada pacote e diagrama de fluxo em [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
@@ -267,7 +294,7 @@ go vet ./...
 go test ./...
 ```
 
-Os testes cobrem: mapeamento de arquivo→tabela, inserção em lote (inclusive concorrente e idempotência via `INSERT OR IGNORE`), e a formatação/detecção de fallback do `LOAD DATA` no MySQL. Não exigem banco externo (usam SQLite em arquivo temporário).
+Os testes cobrem: mapeamento de arquivo→tabela, inserção em lote (inclusive concorrente e idempotência via `INSERT OR IGNORE`), paginação de documentos para busca, a formatação/detecção de fallback do `LOAD DATA` no MySQL, o lock distribuído e o rate limiter (contra um Redis real em memória via [miniredis](https://github.com/alicebob/miniredis)), e o cliente Meilisearch (contra um servidor HTTP fake simulando a API REST real). Não exigem infraestrutura externa — SQLite em arquivo temporário, Redis em memória, Meilisearch mockado.
 
 ## 🤝 Contribuindo
 
@@ -280,9 +307,10 @@ Transparência sobre o estado atual do projeto — bom pra quem quiser contribui
 - `turso` e `duckdb` são hoje apenas um alias do driver SQLite local — implementar clientes nativos de verdade é a contribuição mais valiosa que falta.
 - Há duplicação de código entre os 4 drivers de banco (`GetCNPJ`, `SearchCNPJ`, `GetStats` são quase idênticos entre eles) — funcional, mas um ponto de atenção para quem for mexer em uma query.
 - O CORS da API está aberto (`Access-Control-Allow-Origin: *`) em todos os endpoints — avaliado como baixo risco dado o esquema de autenticação por token, mas vale revisar se o seu caso de uso exigir mais restrição.
-- Sem suíte de testes de integração contra um banco real (Postgres/MySQL/ClickHouse) — os testes automatizados usam SQLite; as otimizações de busca por nome (`pg_trgm`/`FULLTEXT`/`ngrambf_v1`) foram revisadas manualmente com cuidado, mas não puderam ser validadas ao vivo contra um servidor real até agora (todas têm fallback automático, então na pior hipótese só perdem o ganho de velocidade, sem quebrar).
-- `SQLite`/`turso`/`duckdb` não têm nenhuma aceleração para busca por nome (`GET /api/v1/busca` faz scan completo nesses drivers) — um índice FTS5 resolveria, mas ainda não foi implementado.
-- ClickHouse usa `FINAL` nas leituras de `GetCNPJ`/`SearchCNPJ`/`GetStats` para garantir dedupe correto (ver [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)) — corrige um bug real, mas tem custo de performance na leitura em tabelas muito grandes; não foi otimizado além disso.
+- Sem suíte de testes de integração contra um banco real (Postgres/MySQL/ClickHouse) — os testes automatizados usam SQLite; as otimizações de busca por nome **no SQL** (`pg_trgm`/`FULLTEXT`/`ngrambf_v1`) foram revisadas manualmente com cuidado, mas não puderam ser validadas ao vivo contra um servidor real até agora (todas têm fallback automático, então na pior hipótese só perdem o ganho de velocidade, sem quebrar). Diferente disso, o **Redis** (lock distribuído, rate limiting) e o **cliente Meilisearch** foram testados de verdade — contra um Redis real em memória ([miniredis](https://github.com/alicebob/miniredis)) e um servidor HTTP fake simulando a API REST real do Meilisearch, respectivamente — não são "só revisão manual".
+- `SQLite`/`turso`/`duckdb` não têm nenhuma aceleração nativa de busca por nome (`GET /api/v1/busca` faz scan completo nesses drivers sem Meilisearch); habilitar o Meilisearch é a forma recomendada de acelerar a busca nesses drivers.
+- ClickHouse usa `FINAL` nas leituras de `GetCNPJ`/`SearchCNPJ`/`GetStats`/`GetSearchDocuments` para garantir dedupe correto (ver [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)) — corrige um bug real, mas tem custo de performance na leitura em tabelas muito grandes; não foi otimizado além disso.
+- A sincronização com o Meilisearch é uma reindexação completa a cada carga com dados novos, não incremental — simples e correto, mas reprocessa a tabela inteira mesmo que só um arquivo pequeno tenha mudado. Aceitável dado que a Receita Federal só atualiza mensalmente; passaria a valer a pena otimizar se a cadência de atualização mudasse.
 - Nunca foi medido um tempo real de ponta a ponta para uma carga completa em produção — as estimativas de performance no README são por ordem de grandeza, não medição.
 
 ## 📄 Licença

@@ -1,51 +1,84 @@
 package etl
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"os"
 	"path/filepath"
 	"strings"
-	"sync/atomic"
 	"time"
+
+	"github.com/redis/go-redis/v9"
 
 	"github.com/leandronunes07/cnpj-rfb/pkg/config"
 	"github.com/leandronunes07/cnpj-rfb/pkg/crawler"
 	"github.com/leandronunes07/cnpj-rfb/pkg/database"
 	"github.com/leandronunes07/cnpj-rfb/pkg/downloader"
 	"github.com/leandronunes07/cnpj-rfb/pkg/extractor"
+	"github.com/leandronunes07/cnpj-rfb/pkg/lock"
 	"github.com/leandronunes07/cnpj-rfb/pkg/schema"
+	"github.com/leandronunes07/cnpj-rfb/pkg/search"
 )
 
 type Pipeline struct {
-	cfg        *config.Config
-	db         database.DBDriver
-	crawler    *crawler.ReceitaCrawler
-	downloader *downloader.Downloader
-	extractor  *extractor.Extractor
-	running    atomic.Bool
+	cfg          *config.Config
+	db           database.DBDriver
+	crawler      *crawler.ReceitaCrawler
+	downloader   *downloader.Downloader
+	extractor    *extractor.Extractor
+	runLock      lock.PipelineLock
+	searchClient *search.Client // nil when Meilisearch isn't configured
 }
 
-func NewPipeline(cfg *config.Config, db database.DBDriver) *Pipeline {
+// NewPipeline wires up the pipeline.
+//
+// redisClient may be nil — in that case the "only one execution at a time"
+// guard is an in-process lock, which is all a single-instance deployment
+// needs. Pass a real client when the app runs as multiple instances/
+// replicas against the same database, so the guard actually holds across
+// processes instead of just within one.
+//
+// searchClient may be nil — in that case GET /api/v1/busca stays on the
+// SQL-based search path (see pkg/database) unchanged. Pass a real client to
+// have the pipeline keep a Meilisearch index in sync after every successful
+// run, which the API then prefers when available.
+func NewPipeline(cfg *config.Config, db database.DBDriver, redisClient *redis.Client, searchClient *search.Client) *Pipeline {
 	rc := crawler.NewReceitaCrawler(cfg.BaseURL)
+
+	var runLock lock.PipelineLock
+	if redisClient != nil {
+		runLock = lock.NewRedis(redisClient, "cnpjrbf:pipeline:lock")
+	} else {
+		runLock = lock.NewLocal()
+	}
+
 	return &Pipeline{
-		cfg:        cfg,
-		db:         db,
-		crawler:    rc,
-		downloader: downloader.NewDownloader(cfg.DownloadWorkers, rc.Token),
-		extractor:  extractor.NewExtractor(),
+		cfg:          cfg,
+		db:           db,
+		crawler:      rc,
+		downloader:   downloader.NewDownloader(cfg.DownloadWorkers, rc.Token),
+		extractor:    extractor.NewExtractor(),
+		runLock:      runLock,
+		searchClient: searchClient,
 	}
 }
 
 // Run executes the ETL pipeline. It refuses to run concurrently with itself:
 // only one of the boot goroutine, the cron scheduler, and manual API triggers
-// can be importing data at any given time.
+// — across every instance of the app sharing the same lock — can be
+// importing data at any given time.
 func (p *Pipeline) Run() error {
-	if !p.running.CompareAndSwap(false, true) {
-		log.Println("[ETL Pipeline] Execução já em andamento, ignorando novo disparo concorrente.")
+	ctx := context.Background()
+	acquired, err := p.runLock.TryAcquire(ctx)
+	if err != nil {
+		return fmt.Errorf("erro ao adquirir lock de execução do pipeline: %w", err)
+	}
+	if !acquired {
+		log.Println("[ETL Pipeline] Execução já em andamento (nesta instância ou em outra), ignorando novo disparo concorrente.")
 		return fmt.Errorf("pipeline já está em execução")
 	}
-	defer p.running.Store(false)
+	defer p.runLock.Release(ctx)
 
 	log.Println("==================================================================")
 	log.Println("[ETL Pipeline] Iniciando rotina de verificação e carga de dados CNPJ")
@@ -177,6 +210,15 @@ func (p *Pipeline) Run() error {
 		log.Printf("[ETL Pipeline] Warning ao garantir índices: %v", err)
 	}
 
+	// Keep the Meilisearch index in sync now that there's new data. This is
+	// a full reindex, not incremental — simple and correct, and cheap
+	// enough given the Receita Federal data only changes monthly. Only
+	// triggered here (after real work happened this run), not on the
+	// "nothing pending" early return above, so an unchanged day doesn't
+	// pay for re-reading and re-pushing tens of millions of rows for
+	// nothing.
+	p.SyncSearchIndex()
+
 	// Record success in etl_metadata
 	if err := p.db.SaveProcessedMonth(targetMonth); err != nil {
 		log.Printf("[ETL Pipeline] ERRO ao salvar metadados da competência %s: %v", targetMonth, err)
@@ -190,6 +232,64 @@ func (p *Pipeline) Run() error {
 	log.Printf("==================================================================")
 
 	return nil
+}
+
+const searchSyncPageSize = 5000
+
+// SyncSearchIndex pushes every estabelecimento+empresa record into
+// Meilisearch, paginated. It's a no-op (returns immediately) when no search
+// client is configured. Safe to call on its own — main.go also calls this
+// once at boot in the background, independent of Run(), so enabling
+// Meilisearch on a deployment that already has fully-loaded data populates
+// the index without waiting for the next month's new files to trigger it
+// via Run() itself.
+func (p *Pipeline) SyncSearchIndex() {
+	if p.searchClient == nil {
+		return
+	}
+
+	if err := p.searchClient.EnsureIndex(); err != nil {
+		log.Printf("[Search] Warning ao configurar índice do Meilisearch: %v", err)
+		return
+	}
+
+	log.Println("[Search] Sincronizando índice de busca (Meilisearch)...")
+	start := time.Now()
+	total := 0
+
+	for offset := 0; ; offset += searchSyncPageSize {
+		docs, hasMore, err := p.db.GetSearchDocuments(offset, searchSyncPageSize)
+		if err != nil {
+			log.Printf("[Search] ERRO ao ler página de documentos (offset %d) do banco: %v", offset, err)
+			return
+		}
+		if len(docs) == 0 {
+			break
+		}
+
+		searchDocs := make([]search.Document, len(docs))
+		for i, d := range docs {
+			searchDocs[i] = search.Document{
+				CNPJ:         d.CNPJ,
+				RazaoSocial:  d.RazaoSocial,
+				NomeFantasia: d.NomeFantasia,
+				UF:           d.UF,
+				CNAE:         d.CNAE,
+			}
+		}
+
+		if err := p.searchClient.IndexDocuments(searchDocs); err != nil {
+			log.Printf("[Search] ERRO ao indexar página (offset %d) no Meilisearch: %v", offset, err)
+			return
+		}
+
+		total += len(docs)
+		if !hasMore {
+			break
+		}
+	}
+
+	log.Printf("[Search] Índice de busca sincronizado: %d registros em %v.", total, time.Since(start))
 }
 
 func (p *Pipeline) importFileToTable(filePath string, table schema.TableSpec) error {

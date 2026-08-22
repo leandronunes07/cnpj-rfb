@@ -24,6 +24,25 @@ A comparação do token é feita em tempo constante (`crypto/subtle.ConstantTime
 
 Todos os endpoints respondem com `Access-Control-Allow-Origin: *` e aceitam `OPTIONS` (preflight). Isso permite consumir a API a partir de qualquer origem no navegador, desde que o chamador tenha o token — avalie se isso é adequado ao seu caso de uso antes de expor a API publicamente.
 
+### Rate limiting (opcional)
+
+Ativo apenas quando `REDIS_ADDR` está configurado (ver [README](../README.md#-configuração-env)) — sem Redis, não há limite de requisições além do que sua infraestrutura suportar. Quando ativo:
+
+- Limite por **cliente** (IP, considerando `X-Forwarded-For` se presente — assume que a aplicação roda atrás de um proxy reverso confiável, como já documentado em [`TROUBLESHOOTING.md`](TROUBLESHOOTING.md)), não por token (todos os chamadores compartilham o mesmo `API_TOKEN`, então limitar por token seria só um limite global).
+- Janela fixa de 1 minuto, configurável via `RATE_LIMIT_PER_MINUTE` (padrão `120`).
+- Verificado **depois** da autenticação — tentativas de token inválido não consomem o orçamento de um cliente legítimo.
+- Se o Redis estiver configurado mas inacessível no momento da requisição, o limite é ignorado (fail-open) — a API continua respondendo em vez de derrubar tudo por causa de uma dependência opcional.
+
+Ao exceder o limite:
+
+```
+HTTP/1.1 429 Too Many Requests
+Retry-After: 37
+Content-Type: application/json
+
+{ "error": "Limite de requisições excedido. Tente novamente em instantes." }
+```
+
 ---
 
 ## `GET /api/v1/status`
@@ -99,16 +118,17 @@ Busca por razão social / nome fantasia, com filtro opcional de UF.
 | `uf` | não | Sigla da UF (2 letras) para filtrar |
 | `limit` | não | Quantidade de resultados, `1`-`100`. Fora desse intervalo, usa o padrão `20` |
 
-### Como a busca é acelerada (varia por driver)
+### Como a busca é acelerada (varia por driver, e se o Meilisearch está configurado)
 
-Uma busca "contém" (`%termo%`, com wildcard no início) nunca consegue usar um índice B-tree comum — nenhum banco relacional escapa disso. Cada driver compensa isso à sua maneira, de forma transparente pra quem consome a API (o formato da resposta não muda):
+Uma busca "contém" (`%termo%`, com wildcard no início) nunca consegue usar um índice B-tree comum — nenhum banco relacional escapa disso. **Se `MEILISEARCH_HOST` estiver configurado, ele é usado primeiro, sempre** (ranking de relevância, tolerância a erro de digitação); sem ele, cada driver SQL compensa à sua maneira. De forma transparente pra quem consome a API — o formato da resposta é o mesmo em qualquer caso, só o campo `source` muda:
 
-| Driver | Estratégia | Observação |
+| Motor | Estratégia | Observação |
 |---|---|---|
-| `postgres` | Índice GIN trigram (`pg_trgm`) | Acelera a mesma consulta `LIKE`/`ILIKE` sem mudar nenhuma semântica — o resultado é idêntico ao de um scan completo, só mais rápido. Exige a extensão `pg_trgm` (contrib padrão, disponível em praticamente toda instalação/serviço gerenciado); se a conexão não tiver privilégio para criá-la, a aplicação loga um aviso e a busca continua funcionando, só sem aceleração. |
-| `mysql` | Índice `FULLTEXT` + `MATCH ... AGAINST` (boolean mode) | **Muda a semântica**: em vez de "contém a substring", vira "cada palavra do termo de busca, por prefixo" (`agencia` casa com "AGENCIA TARUGA", mas não casaria com "AXAGENCIAX" no meio de outra palavra). Termos com menos de 3 caracteres (limite padrão do MySQL, `innodb_ft_min_token_size`) automaticamente caem de volta para o `LIKE` original, preservando o comportamento antigo nesse caso — então a busca nunca fica "pior" que antes, só mais rápida quando possível. |
-| `clickhouse` | Índice de skip `ngrambf_v1` (bloom filter) | Não muda semântica nenhuma — é um filtro "talvez contenha" que deixa o ClickHouse pular granules inteiros que provadamente não têm match, mantendo o `LIKE` exato por baixo. |
-| `sqlite` / `turso` / `duckdb` | Nenhuma (scan completo) | Aceitável dado o propósito desse driver (desenvolvimento/testes/escala pequena); não há um equivalente leve de índice de texto no SQLite puro sem introduzir uma tabela virtual FTS5 separada, o que ainda não foi implementado. |
+| `meilisearch` | Motor de busca dedicado | Usado sempre que configurado e saudável. Ranking de relevância real, tolerância a erro de digitação, e muito mais rápido que qualquer aceleração SQL em tabelas grandes. Se a consulta ao Meilisearch falhar por qualquer motivo, cai automaticamente para o SQL na mesma requisição — o cliente nunca vê um erro por causa disso. |
+| `postgres` (SQL) | Índice GIN trigram (`pg_trgm`) | Acelera a mesma consulta `LIKE`/`ILIKE` sem mudar nenhuma semântica — o resultado é idêntico ao de um scan completo, só mais rápido. Exige a extensão `pg_trgm` (contrib padrão, disponível em praticamente toda instalação/serviço gerenciado); se a conexão não tiver privilégio para criá-la, a aplicação loga um aviso e a busca continua funcionando, só sem aceleração. |
+| `mysql` (SQL) | Índice `FULLTEXT` + `MATCH ... AGAINST` (boolean mode) | **Muda a semântica**: em vez de "contém a substring", vira "cada palavra do termo de busca, por prefixo" (`agencia` casa com "AGENCIA TARUGA", mas não casaria com "AXAGENCIAX" no meio de outra palavra). Termos com menos de 3 caracteres (limite padrão do MySQL, `innodb_ft_min_token_size`) automaticamente caem de volta para o `LIKE` original, preservando o comportamento antigo nesse caso — então a busca nunca fica "pior" que antes, só mais rápida quando possível. |
+| `clickhouse` (SQL) | Índice de skip `ngrambf_v1` (bloom filter) | Não muda semântica nenhuma — é um filtro "talvez contenha" que deixa o ClickHouse pular granules inteiros que provadamente não têm match, mantendo o `LIKE` exato por baixo. |
+| `sqlite` / `turso` / `duckdb` (SQL) | Nenhuma (scan completo) | Aceitável dado o propósito desse driver (desenvolvimento/testes/escala pequena); habilitar o Meilisearch é a forma recomendada de acelerar a busca nesses drivers. |
 
 ```bash
 curl -H "X-API-Token: $API_TOKEN" "http://localhost:8080/api/v1/busca?q=agencia+taruga&uf=MG&limit=10"
@@ -119,6 +139,7 @@ curl -H "X-API-Token: $API_TOKEN" "http://localhost:8080/api/v1/busca?q=agencia+
   "query": "agencia taruga",
   "uf": "MG",
   "total_count": 1,
+  "source": "meilisearch",
   "results": [
     {
       "cnpj": "00000000000000",
@@ -130,6 +151,8 @@ curl -H "X-API-Token: $API_TOKEN" "http://localhost:8080/api/v1/busca?q=agencia+
   ]
 }
 ```
+
+O campo `source` é sempre `"meilisearch"` ou `"sql"`, indicando qual motor respondeu essa requisição específica — útil para depurar se o Meilisearch está de fato sendo usado.
 
 `400 Bad Request` se `q` estiver ausente.
 
@@ -187,4 +210,5 @@ Todos os erros seguem o mesmo formato:
 | `400` | Parâmetro obrigatório ausente ou inválido |
 | `401` | Token ausente ou inválido |
 | `404` | Recurso não encontrado (ex.: CNPJ inexistente na base) |
+| `429` | Rate limit excedido (só quando Redis está configurado) — veja o header `Retry-After` |
 | `500` | Erro interno (ex.: falha de conexão com o banco) |

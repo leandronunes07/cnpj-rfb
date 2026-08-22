@@ -1,6 +1,7 @@
 package database
 
 import (
+	"database/sql"
 	"fmt"
 
 	"github.com/leandronunes07/cnpj-rfb/pkg/config"
@@ -32,6 +33,24 @@ type DBDriver interface {
 	GetCNPJ(cnpj string) (map[string]interface{}, error)
 	SearchCNPJ(query string, uf string, limit int) ([]map[string]interface{}, error)
 	GetStats() (map[string]interface{}, error)
+	// GetSearchDocuments returns a page of denormalized, joined records for
+	// bulk-exporting into an external search index (see pkg/search) — the
+	// same estabelecimento+empresa join SearchCNPJ itself uses, just
+	// paginated and without a query filter. hasMore reports whether another
+	// call with a higher offset would return more rows.
+	GetSearchDocuments(offset, limit int) (docs []SearchDocument, hasMore bool, err error)
+}
+
+// SearchDocument is the flat, denormalized record exported to an external
+// search index (pkg/search.Document mirrors this shape on the other side of
+// that boundary — kept as two separate types so pkg/database doesn't need
+// to import pkg/search).
+type SearchDocument struct {
+	CNPJ         string
+	RazaoSocial  string
+	NomeFantasia string
+	UF           string
+	CNAE         int64
 }
 
 func NewDBDriver(cfg *config.Config) (DBDriver, error) {
@@ -69,6 +88,39 @@ func placeholderBatchLimit(numCols int, configuredBatchSize int, maxPlaceholders
 		limit = configuredBatchSize
 	}
 	return limit
+}
+
+// scanSearchDocuments reads rows shaped (cnpj, razao_social, nome_fantasia,
+// uf, cnae_fiscal_principal) — the common column order every driver's
+// GetSearchDocuments query selects — into SearchDocuments. Callers request
+// limit+1 rows from the database; this trims back to limit and reports
+// whether that extra row existed (hasMore), so pagination doesn't need a
+// separate COUNT(*) query.
+func scanSearchDocuments(rows *sql.Rows, limit int) ([]SearchDocument, bool, error) {
+	var docs []SearchDocument
+	for rows.Next() {
+		var cnpj, razao, fantasia, uf sql.NullString
+		var cnae sql.NullInt64
+		if err := rows.Scan(&cnpj, &razao, &fantasia, &uf, &cnae); err != nil {
+			return nil, false, err
+		}
+		docs = append(docs, SearchDocument{
+			CNPJ:         cnpj.String,
+			RazaoSocial:  razao.String,
+			NomeFantasia: fantasia.String,
+			UF:           uf.String,
+			CNAE:         cnae.Int64,
+		})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, false, err
+	}
+
+	hasMore := len(docs) > limit
+	if hasMore {
+		docs = docs[:limit]
+	}
+	return docs, hasMore, nil
 }
 
 func NullIfEmpty(val string) interface{} {

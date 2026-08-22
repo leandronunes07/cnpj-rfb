@@ -11,13 +11,14 @@ flowchart TD
     C --> D["pkg/etl.Pipeline<br/>casa arquivo → tabela pelo prefixo<br/>do nome (schema.Tables)"]
     D --> E["pkg/database.DBDriver<br/>InsertBatch em lote,<br/>uma transação por lote"]
     E --> F["EnsureIndexes()<br/>roda uma vez, no fim da carga"]
+    F --> J["SyncSearchIndex()<br/>se MEILISEARCH_HOST configurado"]
 
     G["pkg/scheduler<br/>cron diário"] -.dispara.-> D
     H["pkg/api<br/>POST /trigger-etl"] -.dispara.-> D
     I["boot (main.go)"] -.dispara.-> D
 ```
 
-Boot, cron e trigger manual da API podem, em teoria, disparar `Pipeline.Run()` ao mesmo tempo — um `atomic.Bool` em `pkg/etl/pipeline.go` garante que só uma execução roda por vez; as demais são recusadas com um log explicativo em vez de rodar em paralelo e disputar os mesmos arquivos.
+Boot, cron e trigger manual da API podem, em teoria, disparar `Pipeline.Run()` ao mesmo tempo — `pkg/lock` garante que só uma execução roda por vez; as demais são recusadas com um log explicativo em vez de rodar em paralelo e disputar os mesmos arquivos. Ver [Lock de execução do pipeline](#lock-de-execução-do-pipeline-pkglock) abaixo.
 
 ## Paralelismo dentro de uma execução
 
@@ -61,6 +62,43 @@ Isso é seguro porque:
 | `pkg/api` | Servidor HTTP: middleware de autenticação, handlers REST, broadcaster de Server-Sent Events para o console de logs do dashboard. |
 | `pkg/web` | Dashboard estático (HTML/CSS/JS) embutido no binário via `go:embed` — não depende de arquivos externos em produção. |
 | `pkg/scheduler` | Encapsula `robfig/cron` para disparar `Pipeline.Run()` na expressão configurada em `CRON_SCHEDULE`. |
+| `pkg/lock` | Lock de execução única do pipeline — local (`atomic.Bool`) por padrão, ou distribuído via Redis quando `REDIS_ADDR` está configurado. |
+| `pkg/search` | Cliente Meilisearch para a busca por nome — opcional, usado quando `MEILISEARCH_HOST` está configurado. |
+
+## Lock de execução do pipeline (`pkg/lock`)
+
+`Pipeline.Run()` nunca pode rodar duas vezes ao mesmo tempo — duas execuções concorrentes disputariam os mesmos arquivos e poderiam corromper o controle de idempotência. A interface `lock.PipelineLock` tem duas implementações:
+
+- **`lock.Local`** (padrão, sem Redis): um `atomic.Bool` em processo. Resolve o caso de uma única instância da aplicação — boot, cron e trigger manual da API competem pelo mesmo lock em memória.
+- **`lock.Redis`** (quando `REDIS_ADDR` está configurado): uma chave Redis com `SET NX EX` (compare-and-set atômico) e TTL. Necessário assim que a aplicação roda como múltiplas instâncias/réplicas — um `atomic.Bool` de uma instância é invisível pras outras.
+
+O `lock.Redis` tem dois detalhes de correção que valem a pena entender:
+
+1. **Heartbeat**: o TTL da chave é curto (5 minutos) mas é renovado (`EXPIRE`) a cada TTL/3 enquanto o lock estiver em uso, por uma goroutine em background. Isso resolve a tensão entre "TTL curto o bastante pra uma instância travada não bloquear as outras pra sempre" e "carga real pode levar horas, não pode perder o lock no meio".
+2. **Release seguro**: ao liberar, um script Lua confere atomicamente se a chave ainda pertence ao token dessa instância antes de apagar — sem isso, uma instância A que demorou mais que o TTL (e já perdeu o lock pra uma instância B) poderia, ao tentar liberar seu lock "achando" que ainda é dono, apagar o lock que B legitimamente adquiriu depois.
+
+Ambos os cenários (perda de lock por TTL, tentativa de liberar um lock que já não é seu) têm testes reais em `pkg/lock/lock_test.go`, rodando contra um Redis de verdade em memória ([miniredis](https://github.com/alicebob/miniredis)) — não é só revisão de código.
+
+## Busca por nome e Meilisearch (`pkg/search`)
+
+Quando `MEILISEARCH_HOST` está configurado, `GET /api/v1/busca` usa o Meilisearch em vez da aceleração SQL do driver (ver [`docs/API.md`](API.md#como-a-busca-é-acelerada-varia-por-driver-e-se-o-meilisearch-está-configurado)). Isso exige manter o índice do Meilisearch sincronizado com o banco relacional, que é a fonte de verdade — o Meilisearch é só uma cópia denormalizada otimizada pra busca.
+
+```mermaid
+flowchart LR
+    A["Pipeline.Run() termina<br/>uma carga com dados novos"] --> B["Pipeline.SyncSearchIndex()"]
+    C["boot (main.go)"] -.se MEILISEARCH_HOST<br/>configurado.-> B
+    B --> D["db.GetSearchDocuments(offset, limit)<br/>paginado, join estabelecimento+empresa"]
+    D --> E["search.Client.IndexDocuments()<br/>upsert em lote no Meilisearch"]
+```
+
+Pontos de design:
+
+- **Reindexação completa, não incremental.** Cada sincronização relê a tabela `estabelecimento` inteira (paginada via `GetSearchDocuments`) e reenvia tudo para o Meilisearch. Mais simples e mais fácil de raciocinar sobre corretude do que rastrear exatamente quais `cnpj_basico` mudaram — um custo aceitável dado que a Receita Federal só publica dados novos uma vez por mês.
+- **Dois gatilhos, não só um.** `SyncSearchIndex` roda depois de qualquer `Pipeline.Run()` que efetivamente carregou arquivos novos, **e** uma vez no boot da aplicação (em background, fora do fluxo do `Run()`). O segundo gatilho existe para o caso de alguém habilitar o Meilisearch numa instalação que já tem dados carregados — sem ele, o índice ficaria vazio até a próxima competência ser publicada pela Receita Federal.
+- **Assíncrono e best-effort.** `IndexDocuments` retorna assim que o Meilisearch confirma o enfileiramento da tarefa, não quando ela termina de aplicar — apropriado para um índice de busca mantido eventualmente consistente, diferente do banco relacional principal.
+- **Fallback automático na leitura.** Se a consulta ao Meilisearch falhar (indisponível, erro de rede, etc.), `APIHandler.search` cai para `db.SearchCNPJ` na mesma requisição — o cliente da API nunca vê esse detalhe, só um `source: "sql"` na resposta em vez de `"meilisearch"`.
+
+O cliente (`pkg/search/search.go`) tem testes reais em `pkg/search/search_test.go` contra um `httptest.Server` que reproduz os endpoints REST exatos do Meilisearch (path, método HTTP, código de status — conferidos na própria fonte do `meilisearch-go`), não contra uma instância real — mas exercitando a construção de requisição e parsing de resposta de verdade, não só leitura de código.
 
 ## A interface `DBDriver`
 
@@ -81,13 +119,15 @@ type DBDriver interface {
 	GetCNPJ(cnpj string) (map[string]interface{}, error)
 	SearchCNPJ(query string, uf string, limit int) ([]map[string]interface{}, error)
 	GetStats() (map[string]interface{}, error)
+	GetSearchDocuments(offset, limit int) (docs []SearchDocument, hasMore bool, err error)
 }
 ```
 
-Dois pontos que não são óbvios de fora:
+Três pontos que não são óbvios de fora:
 
 - **`InitSchema` cria tabelas, mas não os índices secundários.** Índices são responsabilidade de `EnsureIndexes`, chamado pelo pipeline só depois que a carga termina — criar índice antes de carregar dados faz o banco manter esse índice atualizado a cada `INSERT`, o que é o maior fator de lentidão em uma carga em massa do zero.
 - **`BatchLimit` não é um número fixo.** Drivers que fazem `INSERT` multi-linha com um placeholder por célula (Postgres, SQLite, e o fallback do MySQL) precisam limitar o lote para não estourar o teto de placeholders da conexão. O MySQL, enquanto `LOAD DATA LOCAL INFILE` estiver disponível, não tem essa restrição (é texto streamado, não usa `?`), então usa `BatchSize` diretamente. Ver a seção de Performance no [README](../README.md#performance) para a fórmula completa.
+- **`GetSearchDocuments` existe só para exportar dados, não para servir a API.** É usado exclusivamente por `Pipeline.SyncSearchIndex` para paginar `estabelecimento` join `empresa` inteiro e alimentar o Meilisearch — `SearchCNPJ` continua sendo o caminho usado pela API quando não há Meilisearch configurado. `hasMore` é calculado buscando `limit+1` linhas e conferindo se a linha extra existiu, evitando um `COUNT(*)` separado (caro em tabelas de dezenas de milhões de linhas) só para saber se existe mais uma página.
 
 ## Adicionando um novo driver de banco
 

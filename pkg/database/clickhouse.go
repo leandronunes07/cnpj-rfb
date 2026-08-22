@@ -359,6 +359,31 @@ func (c *ClickHouseDriver) GetStats() (map[string]interface{}, error) {
 	}, nil
 }
 
+func (c *ClickHouseDriver) GetSearchDocuments(offset, limit int) ([]SearchDocument, bool, error) {
+	// LIMIT/OFFSET are inlined (not bound as ? placeholders) to match every
+	// other LIMIT in this file — safe here since both values are ints from
+	// our own pagination loop, never user input.
+	query := fmt.Sprintf(`
+	SELECT
+		concat(e.cnpj_basico, e.cnpj_ordem, e.cnpj_dv) AS cnpj,
+		emp.razao_social,
+		e.nome_fantasia,
+		e.uf,
+		e.cnae_fiscal_principal
+	FROM estabelecimento e FINAL
+	LEFT JOIN empresa emp ON e.cnpj_basico = emp.cnpj_basico
+	ORDER BY e.cnpj_basico, e.cnpj_ordem, e.cnpj_dv
+	LIMIT %d OFFSET %d;`, limit+1, offset)
+
+	rows, err := c.db.Query(query)
+	if err != nil {
+		return nil, false, err
+	}
+	defer rows.Close()
+
+	return scanSearchDocuments(rows, limit)
+}
+
 func sanitizeValueClickHouse(val string, colType string) interface{} {
 	val = strings.TrimSpace(val)
 	if val == "" {

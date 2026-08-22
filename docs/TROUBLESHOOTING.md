@@ -88,6 +88,40 @@ Geralmente aparece se a tabela usa um engine que não suporta `FULLTEXT` (deveri
 
 ---
 
+## Redis (lock distribuído / rate limiting)
+
+### `[Redis] AVISO: não foi possível conectar em ...`
+
+`REDIS_ADDR` está configurado mas a aplicação não conseguiu conectar (endereço errado, Redis fora do ar, firewall, etc.). Isso **não impede a aplicação de iniciar** — ela segue funcionando com o lock de execução do pipeline em memória (só coordena dentro da própria instância) e sem rate limiting na API. Confira:
+
+- O host/porta em `REDIS_ADDR` está correto e acessível a partir do container (se estiver em Docker, use o nome do serviço, ex. `redis:6379`, não `localhost`).
+- Se `REDIS_PASSWORD` estiver configurado, confira que bate com o `requirepass` do servidor.
+- Se estiver usando o `docker-compose --profile extras`, confirme que o serviço `redis` realmente subiu (`docker-compose ps`).
+
+### Rodando múltiplas instâncias e o lock não parece estar coordenando
+
+Confirme que **todas** as instâncias apontam para o mesmo `REDIS_ADDR`/`REDIS_DB` — instâncias apontando para bancos lógicos (`REDIS_DB`) diferentes do mesmo Redis, ou para servidores Redis diferentes, não compartilham o lock entre si (cada uma vê seu próprio namespace).
+
+---
+
+## Meilisearch (busca por nome)
+
+### `[Search] AVISO: não foi possível conectar no Meilisearch em ...`
+
+`MEILISEARCH_HOST` está configurado mas a aplicação não conseguiu falar com ele no boot. A aplicação **continua funcionando** — a busca por nome volta a usar o caminho SQL do driver (ver [`docs/API.md`](API.md#como-a-busca-é-acelerada-varia-por-driver-e-se-o-meilisearch-está-configurado)). Confira:
+
+- A URL em `MEILISEARCH_HOST` inclui o esquema (`http://` ou `https://`) e está acessível a partir do container.
+- Se estiver usando o `docker-compose --profile extras`, o serviço se chama `meilisearch` na rede interna do compose — use `http://meilisearch:7700`, não `localhost`.
+- `MEILISEARCH_API_KEY` bate com a `MEILI_MASTER_KEY` configurada no servidor Meilisearch (se houver uma).
+
+### O índice do Meilisearch está vazio ou desatualizado
+
+- **Instalação nova com dados que já existiam antes de configurar o Meilisearch**: a aplicação sincroniza uma vez no boot além de depois de cada carga — confira o log por `[Search] Sincronizando índice de busca (Meilisearch)...` logo após o boot. Se não aparecer, o Meilisearch não estava saudável no momento do boot (veja o item anterior); reinicie a aplicação depois de garantir que o Meilisearch está acessível.
+- **Dados novos não aparecem na busca**: a sincronização só roda depois de uma execução do pipeline que efetivamente carregou arquivos novos (não em execuções que não encontraram nada pendente) — confira `GET /api/v1/status` → `stats.ultima_competencia` para saber se a carga realmente trouxe dados novos.
+- A sincronização é uma **reindexação completa**, não incremental (ver [`docs/ARCHITECTURE.md`](ARCHITECTURE.md#busca-por-nome-e-meilisearch-pkgsearch)) — para uma base grande, pode levar minutos; acompanhe `[Search] Índice de busca sincronizado: N registros em ...` no log para confirmar que terminou.
+
+---
+
 ## Dashboard / monitoramento
 
 ### O console de logs fica travado / não atualiza em tempo real

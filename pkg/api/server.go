@@ -5,28 +5,41 @@ import (
 	"log"
 	"net/http"
 
+	"github.com/redis/go-redis/v9"
+
 	"github.com/leandronunes07/cnpj-rfb/pkg/config"
 	"github.com/leandronunes07/cnpj-rfb/pkg/database"
 	"github.com/leandronunes07/cnpj-rfb/pkg/etl"
+	"github.com/leandronunes07/cnpj-rfb/pkg/search"
 	"github.com/leandronunes07/cnpj-rfb/pkg/web"
 )
 
 type Server struct {
-	cfg      *config.Config
-	db       database.DBDriver
-	pipeline *etl.Pipeline
+	cfg          *config.Config
+	db           database.DBDriver
+	pipeline     *etl.Pipeline
+	redisClient  *redis.Client  // nil when REDIS_ADDR isn't configured/reachable
+	searchClient *search.Client // nil when MEILISEARCH_HOST isn't configured/reachable
 }
 
-func NewServer(cfg *config.Config, db database.DBDriver, pipeline *etl.Pipeline) *Server {
+func NewServer(cfg *config.Config, db database.DBDriver, pipeline *etl.Pipeline, redisClient *redis.Client, searchClient *search.Client) *Server {
 	return &Server{
-		cfg:      cfg,
-		db:       db,
-		pipeline: pipeline,
+		cfg:          cfg,
+		db:           db,
+		pipeline:     pipeline,
+		redisClient:  redisClient,
+		searchClient: searchClient,
 	}
 }
 
 func (s *Server) Start() error {
-	handler := NewAPIHandler(s.cfg, s.db, s.pipeline)
+	var rateLimiter *RateLimiter
+	if s.redisClient != nil {
+		rateLimiter = NewRateLimiter(s.redisClient, s.cfg.RateLimitPerMinute)
+		log.Printf("[API Server] Rate limiting ativo: %d requisições/minuto por cliente.", s.cfg.RateLimitPerMinute)
+	}
+
+	handler := NewAPIHandler(s.cfg, s.db, s.pipeline, rateLimiter, s.searchClient)
 	mux := http.NewServeMux()
 
 	// API REST Endpoints (Autenticados por API_TOKEN)

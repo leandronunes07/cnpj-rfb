@@ -30,6 +30,22 @@ type Config struct {
 	AutoCleanup     bool
 	CronSchedule    string
 	RunOnce         bool
+
+	// Redis is optional. Empty RedisAddr means "no Redis" — the app falls
+	// back to an in-process pipeline lock and skips API rate limiting
+	// entirely rather than failing to start. Set it once you need either
+	// multi-instance coordination or rate limiting (see docs/API.md).
+	RedisAddr          string
+	RedisPassword      string
+	RedisDB            int
+	RateLimitPerMinute int
+
+	// Meilisearch is optional. Empty MeiliHost means "no search engine" —
+	// GET /api/v1/busca falls back to the SQL-based search (LIKE, or the
+	// driver-specific acceleration described in docs/API.md) unchanged.
+	MeiliHost   string
+	MeiliAPIKey string
+	MeiliIndex  string
 }
 
 func LoadConfig() (*Config, error) {
@@ -97,6 +113,15 @@ func LoadConfig() (*Config, error) {
 		AutoCleanup:     getEnvAsBool("AUTO_CLEANUP", true),
 		CronSchedule:    getEnv("CRON_SCHEDULE", "0 3 * * *"),
 		RunOnce:         getEnvAsBool("RUN_ONCE", false),
+
+		RedisAddr:          getEnv("REDIS_ADDR", ""),
+		RedisPassword:      getEnv("REDIS_PASSWORD", ""),
+		RedisDB:            getEnvAsInt("REDIS_DB", 0),
+		RateLimitPerMinute: getEnvAsInt("RATE_LIMIT_PER_MINUTE", 120),
+
+		MeiliHost:   getEnv("MEILISEARCH_HOST", ""),
+		MeiliAPIKey: getEnv("MEILISEARCH_API_KEY", ""),
+		MeiliIndex:  getEnv("MEILISEARCH_INDEX", "estabelecimentos"),
 	}
 
 	if cfg.APIToken == "" {
