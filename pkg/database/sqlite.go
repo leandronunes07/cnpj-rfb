@@ -70,9 +70,10 @@ func (s *SQLiteDriver) InitSchema() error {
 		var colDefs []string
 		for _, col := range t.Columns {
 			sqType := "TEXT"
-			if col.Type == "INTEGER" {
+			switch col.Type {
+			case "INTEGER":
 				sqType = "INTEGER"
-			} else if col.Type == "NUMERIC" {
+			case "NUMERIC":
 				sqType = "REAL"
 			}
 			colDefs = append(colDefs, fmt.Sprintf("%s %s", col.Name, sqType))

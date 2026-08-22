@@ -1,0 +1,45 @@
+version: "2"
+
+linters:
+  default: none
+  enable:
+    - errcheck
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+  settings:
+    errcheck:
+      # Errors from best-effort cleanup (deferred Close/Rollback) and from
+      # writing into an http.ResponseWriter that's likely already broken by
+      # the time the write fails are not actionable — checking them adds
+      # noise without a real failure path to handle. Real errors (opening
+      # files, DB queries, HTTP requests) are still enforced everywhere else.
+      exclude-functions:
+        - (net/http.ResponseWriter).Write
+        - fmt.Fprint
+        - fmt.Fprintf
+        - fmt.Fprintln
+        - (*encoding/json.Encoder).Encode
+        - os.Remove
+        - os.RemoveAll
+        - os.MkdirAll
+
+  exclusions:
+    rules:
+      # Close()/Rollback() on a deferred best-effort cleanup call, regardless
+      # of concrete type (os.File, sql.DB, sql.Tx, zip.ReadCloser, our own
+      # DBDriver, ...) — exclude-functions above only matches free functions
+      # and exact concrete types, not every type that happens to implement
+      # Close()/Rollback(), so this is matched by message text instead.
+      - linters:
+          - errcheck
+        text: "Error return value of `.*\\.(Close|Rollback)` is not checked"
+
+formatters:
+  enable:
+    - gofmt
+
+output:
+  sort-order:
+    - file

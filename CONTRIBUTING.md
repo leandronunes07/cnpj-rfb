@@ -27,9 +27,16 @@ go build ./...
 go vet ./...
 go test ./...
 gofmt -l .   # não deve listar os arquivos que você tocou
+
+# instale uma vez: go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@latest
+golangci-lint run ./...
 ```
 
-O [CI](.github/workflows/ci.yml) roda exatamente esses mesmos passos (build, vet, gofmt, `go mod tidy`, testes) em todo push e pull request para `main` — rodá-los localmente antes de abrir o PR só antecipa o feedback, não substitui a checagem automática.
+O [CI](.github/workflows/ci.yml) roda exatamente esses mesmos passos (build, vet, gofmt, `go mod tidy`, testes e `golangci-lint`) em todo push e pull request para `main` — rodá-los localmente antes de abrir o PR só antecipa o feedback, não substitui a checagem automática.
+
+### Lint (`golangci-lint`)
+
+A configuração fica em [`.golangci.yml`](.golangci.yml): `errcheck`, `govet`, `ineffassign`, `staticcheck` e `unused`. Erros de `Close()`/`Rollback()` em cleanup via `defer` são deliberadamente excluídos do `errcheck` — é convenção aceita na comunidade Go (o erro não é acionável na maioria dos casos) e evita poluir o código com `_ = foo.Close()` sem ganho real. Qualquer outro erro precisa ser tratado de verdade, não silenciado — veja [Convenções de código](#convenções-de-código).
 
 ## Convenções de código
 

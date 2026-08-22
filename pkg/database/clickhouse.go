@@ -75,9 +75,10 @@ func (c *ClickHouseDriver) InitSchema() error {
 
 		for _, col := range t.Columns {
 			chType := "String"
-			if col.Type == "INTEGER" {
+			switch col.Type {
+			case "INTEGER":
 				chType = "Int64"
-			} else if col.Type == "NUMERIC" {
+			case "NUMERIC":
 				chType = "Float64"
 			}
 			colDefs = append(colDefs, fmt.Sprintf("%s %s", col.Name, chType))

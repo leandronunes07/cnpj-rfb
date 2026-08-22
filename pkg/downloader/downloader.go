@@ -99,7 +99,7 @@ func (d *Downloader) DownloadStream(tasks []DownloadTask, onComplete func(task D
 
 func (d *Downloader) downloadFile(task DownloadTask) error {
 	// Check if already downloaded and matches remote size
-	if d.needsDownload(task.URL, task.DestPath) == false {
+	if !d.needsDownload(task.URL, task.DestPath) {
 		log.Printf("[Downloader] Arquivo já existe e está atualizado (skip): %s", task.Filename)
 		return nil
 	}

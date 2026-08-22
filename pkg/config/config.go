@@ -50,9 +50,10 @@ func LoadConfig() (*Config, error) {
 	}
 
 	defaultPort := 5432
-	if dbDriver == "mysql" {
+	switch dbDriver {
+	case "mysql":
 		defaultPort = 3306
-	} else if dbDriver == "clickhouse" {
+	case "clickhouse":
 		defaultPort = 9000
 	}
 
