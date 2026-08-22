@@ -121,10 +121,10 @@ func (h *APIHandler) HandleSearch(w http.ResponseWriter, r *http.Request) {
 	}
 
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"query":        query,
-		"uf":           uf,
+		"query":       query,
+		"uf":          uf,
 		"total_count": len(results),
-		"results":      results,
+		"results":     results,
 	})
 }
 

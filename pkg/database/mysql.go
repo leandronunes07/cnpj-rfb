@@ -494,20 +494,20 @@ func (m *MySQLDriver) GetCNPJ(cleanCNPJ string) (map[string]interface{}, error) 
 	}
 
 	result := map[string]interface{}{
-		"cnpj":                   cnpjOut.String,
-		"razao_social":           razao.String,
-		"nome_fantasia":          fantasia.String,
-		"situacao_cadastral":     sitCad.Int64,
+		"cnpj":                  cnpjOut.String,
+		"razao_social":          razao.String,
+		"nome_fantasia":         fantasia.String,
+		"situacao_cadastral":    sitCad.Int64,
 		"data_inicio_atividade": dtInicio.Int64,
-		"uf":                     uf.String,
-		"municipio":              munic.Int64,
-		"logradouro":             fmt.Sprintf("%s %s, %s %s", tpLog.String, lograd.String, num.String, comp.String),
-		"bairro":                 bairro.String,
-		"cep":                    cep.String,
-		"telefone":               fmt.Sprintf("(%s) %s", ddd1.String, tel1.String),
-		"email":                  email.String,
-		"opcao_simples":          simplesOpt.String,
-		"opcao_mei":              meiOpt.String,
+		"uf":                    uf.String,
+		"municipio":             munic.Int64,
+		"logradouro":            fmt.Sprintf("%s %s, %s %s", tpLog.String, lograd.String, num.String, comp.String),
+		"bairro":                bairro.String,
+		"cep":                   cep.String,
+		"telefone":              fmt.Sprintf("(%s) %s", ddd1.String, tel1.String),
+		"email":                 email.String,
+		"opcao_simples":         simplesOpt.String,
+		"opcao_mei":             meiOpt.String,
 	}
 
 	return result, nil
@@ -572,11 +572,11 @@ func (m *MySQLDriver) GetStats() (map[string]interface{}, error) {
 	latestMonth, _ := m.GetLatestProcessedMonth()
 
 	return map[string]interface{}{
-		"total_empresas":        totalEmpresas,
+		"total_empresas":         totalEmpresas,
 		"total_estabelecimentos": totalEstab,
-		"total_socios":          totalSocios,
-		"ultima_competencia":    latestMonth,
-		"driver":               "MySQL",
+		"total_socios":           totalSocios,
+		"ultima_competencia":     latestMonth,
+		"driver":                 "MySQL",
 	}, nil
 }
 

@@ -7,6 +7,7 @@
 Download paralelo → stream de extração → carga paralela no banco → API REST + Dashboard em tempo real.<br/>
 Tudo em um único binário compilado, sem runtime, sem dependências externas.
 
+[![CI](https://img.shields.io/github/actions/workflow/status/leandronunes07/cnpj-rfb/ci.yml?branch=main&style=for-the-badge&label=CI)](https://github.com/leandronunes07/cnpj-rfb/actions/workflows/ci.yml)
 [![Go Version](https://img.shields.io/badge/Go-1.22+-00ADD8?style=for-the-badge&logo=go&logoColor=white)](https://go.dev)
 [![License: MIT](https://img.shields.io/github/license/leandronunes07/cnpj-rfb?style=for-the-badge&color=blue)](LICENSE)
 [![Docker Ready](https://img.shields.io/badge/Docker-Ready-2496ED?style=for-the-badge&logo=docker&logoColor=white)](Dockerfile)

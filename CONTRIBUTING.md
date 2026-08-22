@@ -29,7 +29,7 @@ go test ./...
 gofmt -l .   # não deve listar os arquivos que você tocou
 ```
 
-Não há CI configurado neste repositório ainda — rodar esses comandos localmente é a única checagem antes do merge, então não pule.
+O [CI](.github/workflows/ci.yml) roda exatamente esses mesmos passos (build, vet, gofmt, `go mod tidy`, testes) em todo push e pull request para `main` — rodá-los localmente antes de abrir o PR só antecipa o feedback, não substitui a checagem automática.
 
 ## Convenções de código
 
