@@ -224,7 +224,9 @@ func (m *MySQLDriver) EnsureIndexes() error {
 		{"table": "estabelecimento", "name": "idx_estabelecimento_municipio", "col": "municipio"},
 		{"table": "estabelecimento", "name": "idx_estabelecimento_cnae", "col": "cnae_fiscal_principal"},
 		{"table": "estabelecimento", "name": "idx_estabelecimento_situacao", "col": "situacao_cadastral"},
-		{"table": "estabelecimento", "name": "idx_estabelecimento_fantasia", "col": "nome_fantasia(100)"},
+		// nome_fantasia is VARCHAR(60) (see mysqlColumnTypeOverrides) — no
+		// prefix length needed/possible beyond the column's own width.
+		{"table": "estabelecimento", "name": "idx_estabelecimento_fantasia", "col": "nome_fantasia"},
 		{"table": "socios", "name": "idx_socios_cnpj", "col": "cnpj_basico"},
 		{"table": "simples", "name": "idx_simples_cnpj", "col": "cnpj_basico"},
 		{"table": "etl_processed_files", "name": "idx_etl_files_month_file", "col": "data_month, filename"},
@@ -493,18 +495,25 @@ func escapeForLoadData(s string) string {
 }
 
 // isLocalInfileDisabledErr detects the server-side rejection of LOAD DATA
-// LOCAL INFILE (MySQL error 1148), which happens when the server's
-// local_infile system variable is off. Any other error is treated as a real
-// failure and propagated instead of triggering the fallback, so genuine bugs
-// aren't silently masked.
+// LOCAL INFILE, which happens when the server's local_infile system
+// variable is off. The exact error code/wording differs across MySQL
+// versions — confirmed against a real MySQL 8.4 server, which returns
+// error 3948 ("Loading local data is disabled; this must be enabled on
+// both the client and server sides"), not the older 1148 ("the used
+// command is not allowed with this MySQL version") this originally only
+// checked for. Any other error is treated as a real failure and propagated
+// instead of triggering the fallback, so genuine bugs aren't silently
+// masked.
 func isLocalInfileDisabledErr(err error) bool {
 	if err == nil {
 		return false
 	}
 	msg := strings.ToLower(err.Error())
 	return strings.Contains(msg, "1148") ||
+		strings.Contains(msg, "3948") ||
 		strings.Contains(msg, "local_infile") ||
 		strings.Contains(msg, "local infile") ||
+		strings.Contains(msg, "loading local data is disabled") ||
 		strings.Contains(msg, "not allowed with this mysql")
 }
 

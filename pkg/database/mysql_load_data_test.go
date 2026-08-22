@@ -44,6 +44,10 @@ func TestIsLocalInfileDisabledErr(t *testing.T) {
 		{"nil error", nil, false},
 		{"error 1148", errors.New("Error 1148: the used command is not allowed with this MySQL version"), true},
 		{"local_infile mentioned", errors.New("local_infile is disabled"), true},
+		// Real error from a live MySQL 8.4 server (docker mysql:8.4) with
+		// local_infile=0 — different code and wording than 1148, found by
+		// actually running InsertBatch against it.
+		{"error 3948 (real MySQL 8.4 wording)", errors.New("load data infile error in table empresa: Error 3948 (42000): Loading local data is disabled; this must be enabled on both the client and server sides"), true},
 		{"unrelated error", errors.New("Error 1062: Duplicate entry for key 'PRIMARY'"), false},
 		{"connection error", errors.New("connection refused"), false},
 	}
