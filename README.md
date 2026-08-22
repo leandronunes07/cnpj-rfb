@@ -1,62 +1,74 @@
-# CNPJ Receita Federal ETL Engine em Go 🚀
+<div align="center">
 
-Engine em **Go (Golang)** para baixar, extrair, transformar e carregar — de forma incremental e paralela — os dados públicos de **CNPJ e Simples Nacional** disponibilizados pela Receita Federal do Brasil em um banco de dados relacional, com **API REST** e **dashboard web** prontos para consulta.
+# ⚡ CNPJ Receita Federal ETL Engine
 
-Baixa apenas o que ainda não foi processado, transforma os CSVs (ISO-8859-1 → UTF-8) em stream sem carregar o dataset inteiro em memória, e escreve no banco em paralelo.
+### Engine em Go de altíssima performance para ETL dos dados públicos de CNPJ e Simples Nacional da Receita Federal do Brasil
+
+Download paralelo → stream de extração → carga paralela no banco → API REST + Dashboard em tempo real.<br/>
+Tudo em um único binário compilado, sem runtime, sem dependências externas.
+
+[![Go Version](https://img.shields.io/badge/Go-1.22+-00ADD8?style=for-the-badge&logo=go&logoColor=white)](https://go.dev)
+[![License: MIT](https://img.shields.io/github/license/leandronunes07/cnpj-rfb?style=for-the-badge&color=blue)](LICENSE)
+[![Docker Ready](https://img.shields.io/badge/Docker-Ready-2496ED?style=for-the-badge&logo=docker&logoColor=white)](Dockerfile)
+[![Last Commit](https://img.shields.io/github/last-commit/leandronunes07/cnpj-rfb?style=for-the-badge&color=orange)](https://github.com/leandronunes07/cnpj-rfb/commits/main)
+[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen?style=for-the-badge)](CONTRIBUTING.md)
+
+[![Go](https://img.shields.io/badge/Go-00ADD8?logo=go&logoColor=white)](https://go.dev)
+[![PostgreSQL](https://img.shields.io/badge/PostgreSQL-4169E1?logo=postgresql&logoColor=white)](https://www.postgresql.org)
+[![MySQL](https://img.shields.io/badge/MySQL-4479A1?logo=mysql&logoColor=white)](https://www.mysql.com)
+[![SQLite](https://img.shields.io/badge/SQLite-003B57?logo=sqlite&logoColor=white)](https://www.sqlite.org)
+[![ClickHouse](https://img.shields.io/badge/ClickHouse-FFCC01?logo=clickhouse&logoColor=black)](https://clickhouse.com)
+[![Docker](https://img.shields.io/badge/Docker-2496ED?logo=docker&logoColor=white)](https://www.docker.com)
+
+[Instalação rápida](#-instalação-rápida) •
+[Por que Go?](#-por-que-go) •
+[API](docs/API.md) •
+[Arquitetura](docs/ARCHITECTURE.md) •
+[Contribuindo](CONTRIBUTING.md)
+
+</div>
 
 ---
 
-## Índice
+## 🚀 Visão geral
 
-- [Visão geral](#visão-geral)
-- [Funcionalidades](#funcionalidades)
-- [Arquitetura](#arquitetura)
-- [Requisitos](#requisitos)
-- [Instalação rápida](#instalação-rápida)
-- [Configuração (`.env`)](#configuração-env)
-- [Bancos de dados suportados](#bancos-de-dados-suportados)
-- [Tabelas geradas](#tabelas-geradas)
-- [Uso](#uso)
-- [Performance](#performance)
-- [Solução de problemas](#solução-de-problemas)
-- [Segurança](#segurança)
-- [Estrutura do projeto](#estrutura-do-projeto)
-- [Testes](#testes)
-- [Contribuindo](#contribuindo)
-- [Limitações conhecidas](#limitações-conhecidas)
-- [Licença](#licença)
-- [Autor](#autor)
+A Receita Federal publica mensalmente, em formato `.zip`, os dados públicos de **todas as empresas registradas no Brasil** — CNPJ, sócios, situação cadastral, endereço, CNAE, opção pelo Simples Nacional/MEI. É um dos datasets públicos mais pesados do governo brasileiro: dezenas de arquivos, muitos GB compactados, dezenas de milhões de linhas.
 
----
+Este projeto é uma engine de ETL construída do zero em **Go** especificamente para esse problema: baixar só o que mudou, processar em stream sem estourar RAM, carregar em paralelo com o mínimo overhead possível, e servir os dados prontos via API REST — tudo automatizado, todo dia, sem intervenção manual.
 
-## Visão geral
+1. Descobre a competência (`YYYY-MM`) mais recente disponível na Receita Federal.
+2. Baixa, em paralelo, só os arquivos ainda não processados (idempotente).
+3. Descompacta e faz streaming de cada CSV (`ISO-8859-1` → `UTF-8`), sem carregar o arquivo inteiro em memória.
+4. Carrega no banco em lotes, com paralelismo real entre arquivos — não é "baixa tudo, depois importa tudo".
+5. Expõe os dados via API REST autenticada e um dashboard web com console de logs ao vivo.
+6. Repete automaticamente todo dia, baixando só o que for novo.
 
-A Receita Federal publica mensalmente, em `https://arquivos.receitafederal.gov.br/...`, um conjunto de arquivos `.zip` com os dados públicos de todas as empresas registradas no Brasil (CNPJ, sócios, situação cadastral, endereço, opção pelo Simples/MEI, etc). São dezenas de arquivos grandes (o mês inteiro soma vários GB compactados).
+## ⚡ Por que Go?
 
-Este projeto automatiza o ciclo completo:
+Este não é um script de ETL genérico portado para Go — o design inteiro explora o que a linguagem faz de melhor para exatamente este tipo de carga de trabalho:
 
-1. Descobre a competência (`YYYY-MM`) mais recente disponível.
-2. Lista e baixa os arquivos `.zip` que ainda não foram importados (idempotente — reprocessar não duplica dados).
-3. Descompacta e faz streaming de cada CSV, convertendo `ISO-8859-1` → `UTF-8`.
-4. Carrega os dados no banco de dados escolhido, em lotes, com paralelismo real entre arquivos.
-5. Expõe os dados via API REST e um dashboard web com console de logs em tempo real.
-6. Repete automaticamente todo dia (cron configurável), baixando só o que for novo.
+- **Binário único, sem runtime.** `go build` gera um executável estático — sem instalar interpretador, sem `node_modules`, sem JVM, sem "funciona na minha máquina". O `Dockerfile` deste projeto compila e empacota tudo em uma imagem Alpine mínima.
+- **Goroutines, não threads pesadas.** Uma goroutine custa poucos KB de memória contra os MBs de uma thread de SO. É isso que permite baixar **e** importar dezenas de arquivos em paralelo (`DOWNLOAD_WORKERS`) sem explodir o consumo de RAM — em Python isso normalmente esbarra no GIL ou exige `multiprocessing` pesado; em Node, quer dizer lidar com callbacks/promises para tentar imitar paralelismo real de I/O+CPU.
+- **Streaming de verdade, do zip ao banco.** Extração de `.zip` e parsing de `.csv` são feitos linha a linha via `io.Reader` — o dataset completo (dezenas de GB descompactados) nunca precisa caber em memória. Processar um CSV de milhões de linhas em Python/Node sem reescrever manualmente cada etapa como stream costuma significar carregar o arquivo inteiro na RAM.
+- **Tipagem estática pega erro em tempo de compilação**, não depois de 40 milhões de linhas já inseridas em produção.
+- **Startup instantâneo.** Sem cold start de interpretador — importante para um processo que roda em cron, reinicia em containers pequenos, e precisa responder à API imediatamente após o boot.
+- **`database/sql` nativo e maduro.** Trocar de banco (Postgres, MySQL, SQLite, ClickHouse) é uma variável de ambiente, não uma reescrita — a mesma interface `DBDriver` funciona para todos.
 
-## Funcionalidades
+O resultado prático: uma engine pensada para ser **rápida, enxuta em memória e simples de operar** — um único binário, sem dependências de runtime, capaz de processar um dos maiores datasets públicos do Brasil em uma fração do tempo que uma abordagem ingênua de INSERT sequencial levaria. Detalhes técnicos de cada otimização (paralelismo de importação, índices adiados, `LOAD DATA LOCAL INFILE` no MySQL) estão na seção [Performance](#-performance).
 
-- **Download + importação paralelos**: cada worker baixa um arquivo e imediatamente o descompacta/importa, sem lock global — várias tabelas carregam ao mesmo tempo.
-- **Streaming, não carrega tudo em memória**: extração de `.zip` e parsing de `.csv` são feitos linha a linha.
-- **Multi-banco**: PostgreSQL, MySQL (com `LOAD DATA LOCAL INFILE` nativo), SQLite e ClickHouse — troca via uma variável de ambiente.
-- **Índices adiados**: os índices secundários só são criados depois da carga completa, evitando manutenção de índice a cada `INSERT` durante o backfill inicial.
-- **Idempotente e incremental**: cada arquivo processado com sucesso fica registrado no próprio banco; reexecuções pulam o que já foi feito.
-- **Auto-cleanup**: apaga `.zip`/`.csv` imediatamente após confirmar a inserção, importante em VPS com pouco disco.
-- **Dashboard web embutido**: estatísticas ao vivo, console de logs via Server-Sent Events, testador de API/busca de CNPJ — tudo compilado dentro do binário (`go:embed`), sem dependências externas.
-- **API REST autenticada**: consulta de CNPJ, busca por razão social/UF, status/estatísticas, disparo manual da rotina.
-- **Pronto para Docker / Portainer / Easypanel**: binário estático, container único.
+## ✨ Funcionalidades
 
-## Arquitetura
+- **Download + importação paralelos** — cada worker baixa um arquivo e imediatamente o descompacta/importa, sem lock global.
+- **Streaming de ponta a ponta** — zip e CSV processados linha a linha, memória sob controle mesmo em datasets enormes.
+- **Multi-banco** — PostgreSQL, MySQL (com `LOAD DATA LOCAL INFILE` nativo), SQLite e ClickHouse, trocados por uma variável de ambiente.
+- **Índices adiados** — índices secundários só são criados depois da carga completa, evitando manutenção de índice a cada `INSERT`.
+- **Idempotente e incremental** — cada arquivo processado com sucesso fica registrado; reexecuções pulam o que já foi feito, sem duplicar dados.
+- **Auto-cleanup** — apaga `.zip`/`.csv` imediatamente após confirmar a inserção, essencial em VPS com disco limitado.
+- **Dashboard web embutido** — estatísticas ao vivo, console de logs via Server-Sent Events, testador de API — tudo compilado dentro do binário (`go:embed`).
+- **API REST autenticada** — consulta de CNPJ, busca por razão social/UF, status/estatísticas, disparo manual.
+- **Pronto para produção** — Docker, Docker Compose, Portainer, Easypanel.
 
-Fluxo resumido (detalhes completos, com diagrama, em [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)):
+## 📐 Arquitetura
 
 ```
 crawler → downloader (worker pool) → extractor (stream) → etl.Pipeline → database.DBDriver
@@ -64,22 +76,22 @@ crawler → downloader (worker pool) → extractor (stream) → etl.Pipeline →
                                                               api.Server (REST + SSE) + web dashboard
 ```
 
-Cada worker de download processa (descompacta + importa) o próprio arquivo que baixou — até `DOWNLOAD_WORKERS` arquivos são importados ao mesmo tempo, cada um em sua própria transação.
+Cada worker de download processa (descompacta + importa) o próprio arquivo que baixou — até `DOWNLOAD_WORKERS` arquivos são importados ao mesmo tempo, cada um em sua própria transação. Diagrama completo, explicação do paralelismo e responsabilidade de cada pacote em [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
-## Requisitos
+## 📋 Requisitos
 
 - **Go 1.22+** (só se for compilar/rodar localmente sem Docker)
 - **Docker + Docker Compose** (recomendado para produção)
-- Um banco de dados: PostgreSQL, MySQL, ClickHouse, **ou** nada além do disco local (SQLite)
+- Um banco de dados: PostgreSQL, MySQL, ClickHouse — **ou** nada além do disco local (SQLite)
 - Acesso de rede de saída para `arquivos.receitafederal.gov.br`
 
-## Instalação rápida
+## 🏁 Instalação rápida
 
 ### Docker Compose (recomendado)
 
 ```bash
-git clone https://github.com/<seu-usuario>/cnpj-rbf.git
-cd cnpj-rbf
+git clone https://github.com/leandronunes07/cnpj-rfb.git
+cd cnpj-rfb
 cp .env.example .env
 # edite o .env: pelo menos API_TOKEN e DB_PASSWORD são obrigatórios
 docker-compose up -d --build
@@ -101,11 +113,11 @@ go run ./cmd/cnpj-etl --once     # roda o pipeline uma vez e encerra (ideal para
 ### Easypanel / Portainer
 
 1. Crie uma aplicação a partir deste repositório Git.
-2. Build type: **Dockerfile** (usa o `Dockerfile` do repositório, gera um binário estático em `alpine`).
+2. Build type: **Dockerfile** (usa o `Dockerfile` do repositório, gera um binário estático em Alpine).
 3. Configure as variáveis de ambiente (seção abaixo) — `API_TOKEN` e `DB_PASSWORD` são obrigatórias, a aplicação recusa iniciar sem elas.
 4. Deploy. O container fica de pé, roda a carga inicial no boot e depois só verifica novidades conforme `CRON_SCHEDULE`.
 
-## Configuração (`.env`)
+## ⚙️ Configuração (`.env`)
 
 ```bash
 cp .env.example .env
@@ -113,7 +125,7 @@ cp .env.example .env
 
 | Variável | Descrição | Padrão |
 |---|---|---|
-| `DB_DRIVER` | `postgres`, `mysql`, `sqlite`, `clickhouse` (`turso`/`duckdb` = alias de `sqlite`, ver [Limitações](#limitações-conhecidas)) | `postgres` |
+| `DB_DRIVER` | `postgres`, `mysql`, `sqlite`, `clickhouse` (`turso`/`duckdb` = alias de `sqlite`, ver [Limitações](#-roadmap--limitações-conhecidas)) | `postgres` |
 | `DB_HOST` | Host do banco | `localhost` |
 | `DB_PORT` | Porta do banco | `5432` / `3306` / `9000` |
 | `DB_USER` | Usuário do banco | `postgres` / `root` |
@@ -128,12 +140,12 @@ cp .env.example .env
 | `DATA_BASE_URL` | URL base do compartilhamento da Receita Federal | ver `.env.example` |
 | `DATA_MONTH` | Competência específica (`YYYY-MM`). Vazio = descobre a mais recente automaticamente | — |
 | `DOWNLOAD_WORKERS` | Goroutines paralelas para download **e** importação | `4` |
-| `BATCH_SIZE` | Teto de registros por lote. Valor efetivo por tabela depende do driver — ver [Performance](#performance) | `10000` |
+| `BATCH_SIZE` | Teto de registros por lote. Valor efetivo por tabela depende do driver — ver [Performance](#-performance) | `10000` |
 | `AUTO_CLEANUP` | Apaga `.zip`/`.csv` logo após importar (`true`/`false`) | `true` |
 | `CRON_SCHEDULE` | Expressão cron para checagem diária | `0 3 * * *` |
 | `RUN_ONCE` | Se `true`, roda uma vez e encerra (equivalente a `--once`) | `false` |
 
-## Bancos de dados suportados
+## 🗄️ Bancos de dados suportados
 
 | Driver | Status | Observação |
 |---|---|---|
@@ -141,9 +153,9 @@ cp .env.example .env
 | `mysql` | ✅ Nativo | Usa `LOAD DATA LOCAL INFILE` (bulk-load nativo do MySQL); cai automaticamente para `INSERT IGNORE` em lote se o servidor tiver `local_infile` desabilitado |
 | `sqlite` | ✅ Nativo | Arquivo local, WAL mode, ótimo para testar sem infraestrutura |
 | `clickhouse` | ✅ Nativo | Tabelas `ReplacingMergeTree` (dedupe em merge/`FINAL`) |
-| `turso` / `duckdb` | ⚠️ Alias de `sqlite` | Ainda **não** há cliente nativo Turso/libSQL nem DuckDB — essas opções só existem para não quebrar quem já as configurou; funcionam como um SQLite local comum. Ver [Limitações](#limitações-conhecidas) |
+| `turso` / `duckdb` | ⚠️ Alias de `sqlite` | Ainda **não** há cliente nativo Turso/libSQL nem DuckDB — essas opções só existem para não quebrar quem já as configurou; funcionam como um SQLite local comum |
 
-## Tabelas geradas
+## 📊 Tabelas geradas
 
 | Tabela | Conteúdo |
 |---|---|
@@ -156,7 +168,7 @@ cp .env.example .env
 | `etl_processed_files` | Controle individual de cada arquivo já importado (garante idempotência) |
 | `vw_cnpj_completo` | View com join pronto de estabelecimento + empresa + simples + domínios |
 
-## Uso
+## 🖥️ Uso
 
 ### Dashboard web
 
@@ -185,15 +197,19 @@ go run ./cmd/cnpj-etl           # serviço: API + cron diário
 go run ./cmd/cnpj-etl --once    # roda o pipeline uma vez e encerra
 ```
 
-## Performance
+## 🔥 Performance
 
-- A carga inicial completa (todos os arquivos do zero) é a etapa mais pesada — dezenas de milhões de linhas em `estabelecimento`/`empresa`/`socios`/`simples`. O tempo real depende muito do hardware do banco e da velocidade da rede até a Receita Federal; não há um número universal.
-- **MySQL usa `LOAD DATA LOCAL INFILE`** por padrão (muito mais rápido que `INSERT` em lote). Se o log mostrar `AVISO: LOAD DATA LOCAL INFILE indisponível`, veja [Solução de problemas](#solução-de-problemas) para habilitar `local_infile` no servidor.
-- Índices secundários são criados **depois** da carga completa, não durante — não tente acelerar desabilitando isso, já está otimizado dessa forma.
-- `BATCH_SIZE` controla o teto de linhas por lote; para drivers que usam `INSERT` multi-linha (Postgres/SQLite, e o fallback do MySQL) o valor efetivo por tabela é `min(BATCH_SIZE, limite_de_placeholders / nº colunas)` — tabelas largas como `estabelecimento` (~30 colunas) ficam abaixo do teto configurado mesmo se você aumentá-lo bastante.
-- `DOWNLOAD_WORKERS` controla tanto o paralelismo de download quanto de importação (cada worker processa o arquivo que baixou). Aumentar demais pode esbarrar em limites do servidor da Receita Federal ou do seu banco de conexões.
+O que faz essa engine ser rápida não é um único truque, é a soma de várias decisões de arquitetura:
 
-## Solução de problemas
+- **Importação paralela, não sequencial** — até `DOWNLOAD_WORKERS` arquivos são descompactados e carregados no banco ao mesmo tempo, sem lock global entre eles.
+- **`LOAD DATA LOCAL INFILE` no MySQL** — usa o mecanismo nativo de bulk-load do MySQL em vez de `INSERT` em lote, com fallback automático e transparente se o servidor não permitir.
+- **Índices secundários adiados** — criados só depois da carga completa, não a cada `INSERT`, que é o maior fator de lentidão em uma carga em massa do zero.
+- **`ReplacingMergeTree` no ClickHouse** — dedupe em merge, sem overhead de checagem de unicidade por linha.
+- Tempo real de uma carga completa depende muito do hardware do banco e da rede até a Receita Federal — não existe número universal, mas o [guia de performance completo](docs/ARCHITECTURE.md) detalha cada decisão e como ajustar `BATCH_SIZE`/`DOWNLOAD_WORKERS` para o seu ambiente.
+
+Se o log do MySQL mostrar `AVISO: LOAD DATA LOCAL INFILE indisponível`, veja [Solução de problemas](#-solução-de-problemas) para destravar o modo mais rápido.
+
+## 🩹 Solução de problemas
 
 Guia completo em [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md). Os mais comuns:
 
@@ -202,14 +218,14 @@ Guia completo em [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md). Os mais c
 - **`AVISO: LOAD DATA LOCAL INFILE indisponível`** no log do MySQL → habilite `local_infile=1` no servidor MySQL (a aplicação continua funcionando, só mais devagar, via fallback automático).
 - **Dashboard "trava" e não atualiza** → geralmente é proxy reverso (nginx/Traefik) bufferizando a conexão SSE; a aplicação já envia os headers corretos (`X-Accel-Buffering: no` + ping periódico), mas confira a configuração do seu proxy se persistir.
 
-## Segurança
+## 🔒 Segurança
 
 - `API_TOKEN` e `DB_PASSWORD` são obrigatórios — a aplicação recusa iniciar sem eles, não existe fallback fraco.
-- Todos os endpoints da API (inclusive o stream de logs SSE) exigem autenticação.
+- Todos os endpoints da API (inclusive o stream de logs SSE) exigem autenticação, comparada em tempo constante.
 - Nunca exponha a porta da API diretamente na internet sem HTTPS na frente (nginx/Traefik/Caddy) — o `API_TOKEN` viaja em texto puro no header/query string.
 - Se encontrar uma vulnerabilidade, reporte de forma responsável — veja [`CONTRIBUTING.md`](CONTRIBUTING.md).
 
-## Estrutura do projeto
+## 🧩 Estrutura do projeto
 
 ```
 cmd/cnpj-etl/       ponto de entrada (main.go)
@@ -227,7 +243,7 @@ pkg/scheduler/      agendador cron
 
 Detalhes de cada pacote e diagrama de fluxo em [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
-## Testes
+## ✅ Testes
 
 ```bash
 go build ./...
@@ -237,29 +253,45 @@ go test ./...
 
 Os testes cobrem: mapeamento de arquivo→tabela, inserção em lote (inclusive concorrente e idempotência via `INSERT OR IGNORE`), e a formatação/detecção de fallback do `LOAD DATA` no MySQL. Não exigem banco externo (usam SQLite em arquivo temporário).
 
-## Contribuindo
+## 🤝 Contribuindo
 
-Veja [`CONTRIBUTING.md`](CONTRIBUTING.md) — inclui como rodar o ambiente localmente, convenções de código e como adicionar suporte a um novo banco de dados.
+Contribuições são bem-vindas! Veja [`CONTRIBUTING.md`](CONTRIBUTING.md) — inclui como rodar o ambiente localmente, convenções de código e o passo a passo para adicionar suporte a um novo banco de dados.
 
-## Limitações conhecidas
+## 🗺️ Roadmap / Limitações conhecidas
 
-Sendo transparente sobre o estado atual do projeto:
+Transparência sobre o estado atual do projeto — bom pra quem quiser contribuir:
 
-- `turso` e `duckdb` são hoje apenas um alias do driver SQLite local — não há cliente nativo Turso/libSQL nem DuckDB implementado.
-- Há duplicação de código relevante entre os 4 drivers de banco (`GetCNPJ`, `SearchCNPJ`, `GetStats` são quase idênticos entre eles) — funcional, mas um ponto de atenção para quem for mexer em uma query e esquecer de replicar nos outros 3 arquivos.
+- `turso` e `duckdb` são hoje apenas um alias do driver SQLite local — implementar clientes nativos de verdade é a contribuição mais valiosa que falta.
+- Há duplicação de código entre os 4 drivers de banco (`GetCNPJ`, `SearchCNPJ`, `GetStats` são quase idênticos entre eles) — funcional, mas um ponto de atenção para quem for mexer em uma query.
 - O CORS da API está aberto (`Access-Control-Allow-Origin: *`) em todos os endpoints — avaliado como baixo risco dado o esquema de autenticação por token, mas vale revisar se o seu caso de uso exigir mais restrição.
 - Sem suíte de testes de integração contra um banco real (Postgres/MySQL/ClickHouse) — os testes automatizados usam SQLite.
 
-Contribuições bem-vindas em qualquer um desses pontos.
-
-## Licença
+## 📄 Licença
 
 Licenciado sob a [Licença MIT](LICENSE).
 
-## Autor
+---
 
-**Leandro Oliveira Nunes** — [leandro@agenciataruga.com](mailto:leandro@agenciataruga.com)
-[@leandronunes07](https://instagram.com/leandronunes07) no Instagram, Facebook, TikTok e LinkedIn
+<div align="center">
 
-**Agência Taruga** — [www.agenciataruga.com](https://www.agenciataruga.com)
-[@agenciataruga](https://instagram.com/agenciataruga) no Instagram, Facebook, TikTok e LinkedIn
+## 👨‍💻 Autor
+
+**Leandro Oliveira Nunes**
+
+[![Email](https://img.shields.io/badge/Email-leandro%40agenciataruga.com-D14836?style=for-the-badge&logo=gmail&logoColor=white)](mailto:leandro@agenciataruga.com)
+[![GitHub](https://img.shields.io/badge/GitHub-leandronunes07-181717?style=for-the-badge&logo=github&logoColor=white)](https://github.com/leandronunes07)
+[![Instagram](https://img.shields.io/badge/Instagram-%40leandronunes07-E4405F?style=for-the-badge&logo=instagram&logoColor=white)](https://instagram.com/leandronunes07)
+[![Facebook](https://img.shields.io/badge/Facebook-%40leandronunes07-1877F2?style=for-the-badge&logo=facebook&logoColor=white)](https://facebook.com/leandronunes07)
+[![TikTok](https://img.shields.io/badge/TikTok-%40leandronunes07-000000?style=for-the-badge&logo=tiktok&logoColor=white)](https://tiktok.com/@leandronunes07)
+[![LinkedIn](https://img.shields.io/badge/LinkedIn-leandronunes07-0A66C2?style=for-the-badge&logo=linkedin&logoColor=white)](https://linkedin.com/in/leandronunes07)
+
+### Agência Taruga
+
+[![Website](https://img.shields.io/badge/Website-agenciataruga.com-000000?style=for-the-badge&logo=googlechrome&logoColor=white)](https://www.agenciataruga.com)
+[![Instagram](https://img.shields.io/badge/Instagram-%40agenciataruga-E4405F?style=for-the-badge&logo=instagram&logoColor=white)](https://instagram.com/agenciataruga)
+[![Facebook](https://img.shields.io/badge/Facebook-%40agenciataruga-1877F2?style=for-the-badge&logo=facebook&logoColor=white)](https://facebook.com/agenciataruga)
+[![TikTok](https://img.shields.io/badge/TikTok-%40agenciataruga-000000?style=for-the-badge&logo=tiktok&logoColor=white)](https://tiktok.com/@agenciataruga)
+
+<sub>Se este projeto te ajudou, considere deixar uma ⭐ no repositório.</sub>
+
+</div>
