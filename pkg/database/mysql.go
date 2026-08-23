@@ -2,6 +2,7 @@ package database
 
 import (
 	"bytes"
+	"context"
 	"database/sql"
 	"fmt"
 	"io"
@@ -600,6 +601,18 @@ func (m *MySQLDriver) GetCNPJ(cleanCNPJ string) (map[string]interface{}, error) 
 // silently match nothing via FULLTEXT even though LIKE would still find
 // them), so recall never gets worse than before, only faster in the common
 // case.
+// searchQueryTimeout bounds how long a single search query is allowed to
+// run. Verified live: a trailing-wildcard FULLTEXT search for an extremely
+// common prefix (e.g. "SILVA", 200k+ matches) against razao_social can take
+// MySQL 400s+ to even finish its internal FULLTEXT initialization step —
+// and MySQL didn't honor a plain KILL QUERY promptly either. This timeout
+// is passed to MySQL as a MAX_EXECUTION_TIME hint (so the server itself
+// aborts the statement) and also bounds the Go-side context, so a
+// pathological search term degrades the caller's response time instead of
+// hanging indefinitely; SearchCNPJ's existing FULLTEXT-then-LIKE fallback
+// treats a timeout like any other query error.
+const searchQueryTimeout = 8 * time.Second
+
 func (m *MySQLDriver) SearchCNPJ(query string, uf string, limit int) ([]map[string]interface{}, error) {
 	if limit <= 0 || limit > 100 {
 		limit = 20
@@ -618,17 +631,33 @@ func (m *MySQLDriver) SearchCNPJ(query string, uf string, limit int) ([]map[stri
 	return m.searchCNPJLike(query, uf, limit)
 }
 
+// searchCNPJFulltext runs two single-table FULLTEXT lookups UNION'd together
+// instead of one query with `MATCH(a) OR MATCH(b)` across the JOIN. That
+// simpler form is what a first pass would write, but MySQL's optimizer
+// cannot use either FULLTEXT index once the two MATCH clauses (one per side
+// of the join) are combined with OR — verified live via EXPLAIN, which showed
+// a full table scan (type=ALL) over all 72M+ estabelecimento rows despite
+// both indexes existing. Splitting into two subqueries, each with a single
+// MATCH against its own table, lets MySQL use each FULLTEXT index
+// independently; UNION also dedupes the case where both sides match the same
+// establishment.
 func (m *MySQLDriver) searchCNPJFulltext(boolQuery string, uf string, limit int) ([]map[string]interface{}, error) {
-	whereClause := "WHERE (MATCH(emp.razao_social) AGAINST (? IN BOOLEAN MODE) OR MATCH(e.nome_fantasia) AGAINST (? IN BOOLEAN MODE))"
-	args := []interface{}{boolQuery, boolQuery}
-
+	ufClause := ""
+	args := []interface{}{boolQuery}
 	if uf != "" {
-		whereClause += " AND e.uf = ?"
+		ufClause = " AND e.uf = ?"
+	}
+	if uf != "" {
+		args = append(args, strings.ToUpper(uf))
+	}
+	args = append(args, boolQuery)
+	if uf != "" {
 		args = append(args, strings.ToUpper(uf))
 	}
 
+	maxExecMS := searchQueryTimeout.Milliseconds()
 	sqlStr := fmt.Sprintf(`
-	SELECT
+	(SELECT /*+ MAX_EXECUTION_TIME(%d) */
 		CONCAT(e.cnpj_basico, e.cnpj_ordem, e.cnpj_dv) AS cnpj,
 		emp.razao_social,
 		e.nome_fantasia,
@@ -636,10 +665,25 @@ func (m *MySQLDriver) searchCNPJFulltext(boolQuery string, uf string, limit int)
 		e.cnae_fiscal_principal
 	FROM estabelecimento e
 	LEFT JOIN empresa emp ON e.cnpj_basico = emp.cnpj_basico
-	%s
-	LIMIT %d;`, whereClause, limit)
+	WHERE MATCH(e.nome_fantasia) AGAINST (? IN BOOLEAN MODE)%s
+	LIMIT %d)
+	UNION
+	(SELECT /*+ MAX_EXECUTION_TIME(%d) */
+		CONCAT(e.cnpj_basico, e.cnpj_ordem, e.cnpj_dv) AS cnpj,
+		emp.razao_social,
+		e.nome_fantasia,
+		e.uf,
+		e.cnae_fiscal_principal
+	FROM empresa emp
+	JOIN estabelecimento e ON e.cnpj_basico = emp.cnpj_basico
+	WHERE MATCH(emp.razao_social) AGAINST (? IN BOOLEAN MODE)%s
+	LIMIT %d)
+	LIMIT %d;`, maxExecMS, ufClause, limit, maxExecMS, ufClause, limit, limit)
 
-	rows, err := m.db.Query(sqlStr, args...)
+	ctx, cancel := context.WithTimeout(context.Background(), searchQueryTimeout)
+	defer cancel()
+
+	rows, err := m.db.QueryContext(ctx, sqlStr, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -658,7 +702,7 @@ func (m *MySQLDriver) searchCNPJLike(query string, uf string, limit int) ([]map[
 	}
 
 	sqlStr := fmt.Sprintf(`
-	SELECT
+	SELECT /*+ MAX_EXECUTION_TIME(%d) */
 		CONCAT(e.cnpj_basico, e.cnpj_ordem, e.cnpj_dv) AS cnpj,
 		emp.razao_social,
 		e.nome_fantasia,
@@ -667,9 +711,12 @@ func (m *MySQLDriver) searchCNPJLike(query string, uf string, limit int) ([]map[
 	FROM estabelecimento e
 	LEFT JOIN empresa emp ON e.cnpj_basico = emp.cnpj_basico
 	%s
-	LIMIT %d;`, whereClause, limit)
+	LIMIT %d;`, searchQueryTimeout.Milliseconds(), whereClause, limit)
 
-	rows, err := m.db.Query(sqlStr, args...)
+	ctx, cancel := context.WithTimeout(context.Background(), searchQueryTimeout)
+	defer cancel()
+
+	rows, err := m.db.QueryContext(ctx, sqlStr, args...)
 	if err != nil {
 		return nil, err
 	}

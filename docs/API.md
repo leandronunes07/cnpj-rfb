@@ -43,6 +43,38 @@ Content-Type: application/json
 { "error": "Limite de requisições excedido. Tente novamente em instantes." }
 ```
 
+### Exemplo prático — provocando o limite
+
+Com `REDIS_ADDR` configurado e `RATE_LIMIT_PER_MINUTE=5` (baixo de propósito, só pra testar), disparando 8 requisições seguidas do mesmo IP:
+
+```bash
+for i in $(seq 1 8); do
+  echo "requisição $i:"
+  curl -s -o /dev/null -w "  HTTP %{http_code}\n" -H "X-API-Token: $API_TOKEN" http://localhost:8080/api/v1/status
+done
+```
+
+```
+requisição 1:
+  HTTP 200
+requisição 2:
+  HTTP 200
+requisição 3:
+  HTTP 200
+requisição 4:
+  HTTP 200
+requisição 5:
+  HTTP 200
+requisição 6:
+  HTTP 429
+requisição 7:
+  HTTP 429
+requisição 8:
+  HTTP 429
+```
+
+As 5 primeiras passam (dentro do limite da janela); a partir da 6ª, `429` até a janela de 1 minuto renovar. Sem `REDIS_ADDR` configurado, as 8 passariam com `200` — não existe rate limiting sem Redis (ver tabela de variáveis em [README](../README.md#-configuração-env)).
+
 ---
 
 ## `GET /api/v1/status`
@@ -126,7 +158,7 @@ Uma busca "contém" (`%termo%`, com wildcard no início) nunca consegue usar um 
 |---|---|---|
 | `meilisearch` | Motor de busca dedicado | Usado sempre que configurado e saudável. Ranking de relevância real, tolerância a erro de digitação, e muito mais rápido que qualquer aceleração SQL em tabelas grandes. Se a consulta ao Meilisearch falhar por qualquer motivo, cai automaticamente para o SQL na mesma requisição — o cliente nunca vê um erro por causa disso. |
 | `postgres` (SQL) | Índice GIN trigram (`pg_trgm`) | Acelera a mesma consulta `LIKE`/`ILIKE` sem mudar nenhuma semântica — o resultado é idêntico ao de um scan completo, só mais rápido. Exige a extensão `pg_trgm` (contrib padrão, disponível em praticamente toda instalação/serviço gerenciado); se a conexão não tiver privilégio para criá-la, a aplicação loga um aviso e a busca continua funcionando, só sem aceleração. |
-| `mysql` (SQL) | Índice `FULLTEXT` + `MATCH ... AGAINST` (boolean mode) | **Muda a semântica**: em vez de "contém a substring", vira "cada palavra do termo de busca, por prefixo" (`agencia` casa com "AGENCIA TARUGA", mas não casaria com "AXAGENCIAX" no meio de outra palavra). Termos com menos de 3 caracteres (limite padrão do MySQL, `innodb_ft_min_token_size`) automaticamente caem de volta para o `LIKE` original, preservando o comportamento antigo nesse caso — então a busca nunca fica "pior" que antes, só mais rápida quando possível. |
+| `mysql` (SQL) | Índice `FULLTEXT` + `MATCH ... AGAINST` (boolean mode), rodando como duas subqueries (uma por tabela) unidas por `UNION` | **Muda a semântica**: em vez de "contém a substring", vira "cada palavra do termo de busca, por prefixo" (`agencia` casa com "AGENCIA TARUGA", mas não casaria com "AXAGENCIAX" no meio de outra palavra). Termos com menos de 3 caracteres (limite padrão do MySQL, `innodb_ft_min_token_size`) automaticamente caem de volta para o `LIKE` original, preservando o comportamento antigo nesse caso — então a busca nunca fica "pior" que antes, só mais rápida quando possível. Toda query FULLTEXT tem um teto de 8s (`MAX_EXECUTION_TIME` no MySQL + `context.WithTimeout` no Go); se estourar, cai automaticamente para o `LIKE`. Isso importa na prática para um punhado de termos genéricos de uma palavra só (sobrenomes muito comuns tipo "SILVA"/"SANTOS") — o MySQL não consegue expandir o prefixo curinga rapidamente quando ele bate em centenas de milhares de linhas; a resposta ainda sai correta, só demora até ~8s em vez de ficar instantânea. Termos mais específicos (nomes compostos, razão social completa) não sofrem com isso — ver números reais em [`README.md`](../README.md#-performance). |
 | `clickhouse` (SQL) | Índice de skip `ngrambf_v1` (bloom filter) | Não muda semântica nenhuma — é um filtro "talvez contenha" que deixa o ClickHouse pular granules inteiros que provadamente não têm match, mantendo o `LIKE` exato por baixo. |
 | `sqlite` / `turso` / `duckdb` (SQL) | Nenhuma (scan completo) | Aceitável dado o propósito desse driver (desenvolvimento/testes/escala pequena); habilitar o Meilisearch é a forma recomendada de acelerar a busca nesses drivers. |
 
@@ -155,6 +187,67 @@ curl -H "X-API-Token: $API_TOKEN" "http://localhost:8080/api/v1/busca?q=agencia+
 O campo `source` é sempre `"meilisearch"` ou `"sql"`, indicando qual motor respondeu essa requisição específica — útil para depurar se o Meilisearch está de fato sendo usado.
 
 `400 Bad Request` se `q` estiver ausente.
+
+### Exemplos práticos — a mesma busca, com e sem Meilisearch
+
+A URL chamada pelo cliente é **idêntica** nos dois casos — `q`, `uf` e `limit` funcionam igual independente de qual motor responde. O que muda é o `source` na resposta e, em alguns casos, o comportamento por baixo. Exemplos abaixo assumem MySQL como driver e `DB_NAME=cnpjrbf-go`.
+
+**1. Busca simples, `MEILISEARCH_HOST` vazio (só SQL, o padrão de qualquer instalação nova):**
+
+```bash
+curl -H "X-API-Token: $API_TOKEN" "http://localhost:8080/api/v1/busca?q=taruga&limit=5"
+```
+
+```json
+{ "query": "taruga", "uf": "", "total_count": 5, "source": "sql", "results": [ /* ... */ ] }
+```
+
+Por baixo, isso virou (MySQL, ver [`pkg/database/mysql.go`](../pkg/database/mysql.go)) `MATCH(nome_fantasia) AGAINST ('+taruga*' IN BOOLEAN MODE)` — busca por palavra/prefixo, não substring.
+
+**2. A mesma busca, agora com `MEILISEARCH_HOST=http://meilisearch:7700` configurado e saudável:**
+
+```bash
+curl -H "X-API-Token: $API_TOKEN" "http://localhost:8080/api/v1/busca?q=taruga&limit=5"
+```
+
+```json
+{ "query": "taruga", "uf": "", "total_count": 5, "source": "meilisearch", "results": [ /* ... */ ] }
+```
+
+Mesma URL, mesmo formato de resposta — só o `source` muda. Os resultados também vêm ordenados por relevância de verdade (o SQL não rankeia, devolve na ordem que o banco encontrar).
+
+**3. Tolerância a erro de digitação — só funciona com Meilisearch:**
+
+```bash
+# "TARGUA" (G e U trocados) em vez de "TARUGA"
+curl -H "X-API-Token: $API_TOKEN" "http://localhost:8080/api/v1/busca?q=targua&limit=5"
+```
+
+Com Meilisearch: `source: "meilisearch"`, ainda encontra "AGENCIA TARUGA" (tolera 1-2 erros de digitação por padrão, dependendo do tamanho da palavra). Sem Meilisearch (caminho SQL): `source: "sql"`, `total_count: 0` — nem o `FULLTEXT` nem o `LIKE` toleram erro de digitação, o termo tem que estar escrito certo.
+
+**4. Filtro por UF combinado com busca:**
+
+```bash
+curl -H "X-API-Token: $API_TOKEN" "http://localhost:8080/api/v1/busca?q=comercio&uf=SP&limit=10"
+```
+
+Funciona igual nos dois motores — `uf` é um filtro exato (`e.uf = 'SP'` no SQL, `filter: "uf = \"SP\""` no Meilisearch), aplicado **depois** do match textual, então não interfere na semântica da busca por nome.
+
+**5. Termo curto (2 caracteres) — cai pro `LIKE` mesmo com FULLTEXT disponível:**
+
+```bash
+curl -H "X-API-Token: $API_TOKEN" "http://localhost:8080/api/v1/busca?q=bb&limit=5"
+```
+
+No MySQL, termos abaixo de 3 caracteres (`innodb_ft_min_token_size` padrão) nunca batem no índice `FULLTEXT` — a aplicação detecta isso e usa `LIKE '%bb%'` automaticamente, então o resultado ainda sai correto (`source: "sql"`), só sem a aceleração. Com Meilisearch configurado, esse caso nem chega a se importar com esse limite — o Meilisearch não tem esse piso de tamanho de token.
+
+**6. Termo genérico de altíssima frequência (ex.: `SILVA`) — mais lento no caminho SQL, instantâneo no Meilisearch:**
+
+```bash
+curl -w "\ntempo total: %{time_total}s\n" -H "X-API-Token: $API_TOKEN" "http://localhost:8080/api/v1/busca?q=silva&limit=20"
+```
+
+Sem Meilisearch, pode levar alguns segundos (até o teto de 8s antes de cair pro `LIKE` — ver [Solução de problemas](TROUBLESHOOTING.md#busca-no-mysql-demora-vários-segundos-até-8s-para-termos-muito-comuns)). Com Meilisearch, a resposta é praticamente instantânea independente de quão comum for o termo — é justamente o cenário onde o Meilisearch compensa mais o custo de rodar mais um serviço.
 
 ---
 

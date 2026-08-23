@@ -79,6 +79,24 @@ O `lock.Redis` tem dois detalhes de correção que valem a pena entender:
 
 Ambos os cenários (perda de lock por TTL, tentativa de liberar um lock que já não é seu) têm testes reais em `pkg/lock/lock_test.go`, rodando contra um Redis de verdade em memória ([miniredis](https://github.com/alicebob/miniredis)) — não é só revisão de código.
 
+### Exemplo — duas instâncias, mesmo Redis
+
+Cenário: duas réplicas da aplicação (`instancia-A` e `instancia-B`), ambas com `REDIS_ADDR` apontando pro mesmo Redis, cron configurado igual nas duas (`CRON_SCHEDULE=0 3 * * *`). Às 3h, o cron dispara `Pipeline.Run()` nas duas ao mesmo tempo:
+
+```
+# instancia-A
+[ETL Pipeline] Iniciando rotina de verificação e carga de dados CNPJ
+[ETL Pipeline] Competência alvo identificada: 2026-09
+... segue processando normalmente ...
+
+# instancia-B (mesmo instante, Redis compartilhado)
+[ETL Pipeline] Execução já em andamento (nesta instância ou em outra), ignorando novo disparo concorrente.
+```
+
+A instância B nunca chega a listar/baixar arquivo nenhum — `TryAcquire` retorna `false` porque a chave já existe no Redis (posta por A). Sem `REDIS_ADDR` configurado (cada instância com seu `lock.Local`), esse mesmo cenário faria **as duas** processarem ao mesmo tempo, disputando os mesmos arquivos — é exatamente o caso que só o lock distribuído resolve; uma instância sozinha não precisa dele.
+
+Se a instância A cair no meio da carga (crash, OOM, `docker restart`), o heartbeat para de renovar o `EXPIRE` e a chave expira sozinha em até 5 minutos (o TTL) — na próxima janela do cron, B consegue adquirir o lock normalmente. Não existe lock "travado pra sempre" por uma instância que morreu.
+
 ## Busca por nome e Meilisearch (`pkg/search`)
 
 Quando `MEILISEARCH_HOST` está configurado, `GET /api/v1/busca` usa o Meilisearch em vez da aceleração SQL do driver (ver [`docs/API.md`](API.md#como-a-busca-é-acelerada-varia-por-driver-e-se-o-meilisearch-está-configurado)). Isso exige manter o índice do Meilisearch sincronizado com o banco relacional, que é a fonte de verdade — o Meilisearch é só uma cópia denormalizada otimizada pra busca.

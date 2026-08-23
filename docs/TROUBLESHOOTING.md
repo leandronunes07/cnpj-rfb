@@ -86,6 +86,12 @@ Sem isso, a busca no Postgres continua funcionando normalmente, só sem acelera�
 
 Geralmente aparece se a tabela usa um engine que não suporta `FULLTEXT` (deveria ser sempre `InnoDB` aqui, gerado pelo próprio `InitSchema`) ou se a coluna já tem um índice `FULLTEXT` com configuração incompatível de uma versão anterior do schema. Enquanto esse aviso aparecer, a busca no MySQL usa automaticamente o `LIKE` original — nada quebra, só fica mais lenta.
 
+### Busca no MySQL demora vários segundos (até ~8s) para termos muito comuns
+
+Esperado para um punhado de termos de uma palavra só e altíssima frequência (sobrenomes muito comuns tipo "SILVA"/"SANTOS", com centenas de milhares de ocorrências). Não é bug: o MySQL usa busca por prefixo curinga (`+termo*`) no `FULLTEXT` para permitir match parcial, e para um termo extremamente frequente isso força o MySQL a expandir e unir várias palavras do índice que começam com aquele prefixo antes de aplicar o `LIMIT`. A aplicação tem um teto de 8s (`MAX_EXECUTION_TIME` no MySQL + timeout de contexto no Go) — se estourar, cai automaticamente para o `LIKE`, então a resposta sempre volta correta, só não instantânea nesse caso específico. Termos mais específicos (nomes compostos, razão social completa) não têm esse problema. Ver números reais em [`README.md`](../README.md#-performance).
+
+Se aparecer `[MySQL] Warning: busca FULLTEXT falhou (context deadline exceeded)` no log com frequência para termos que não são desse tipo, vale investigar (`EXPLAIN` na query, `SHOW ENGINE INNODB STATUS`) — pode indicar um problema diferente, como o servidor MySQL sob carga pesada de outra operação (ex. uma importação em andamento).
+
 ---
 
 ## Redis (lock distribuído / rate limiting)
