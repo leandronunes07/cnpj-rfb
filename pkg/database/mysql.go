@@ -145,6 +145,17 @@ func (m *MySQLDriver) InitSchema() error {
 		filename VARCHAR(255) NOT NULL,
 		status VARCHAR(32) NOT NULL,
 		processed_at DATETIME DEFAULT CURRENT_TIMESTAMP
+	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+	CREATE TABLE IF NOT EXISTS etl_change_log (
+		id BIGINT AUTO_INCREMENT PRIMARY KEY,
+		cnpj_basico VARCHAR(8) NOT NULL,
+		tabela VARCHAR(32) NOT NULL,
+		campo VARCHAR(64) NOT NULL,
+		valor_antigo TEXT,
+		valor_novo TEXT,
+		competencia VARCHAR(7) NOT NULL,
+		detectado_em DATETIME DEFAULT CURRENT_TIMESTAMP,
+		INDEX idx_change_log_cnpj (cnpj_basico)
 	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;`
 	if _, err := m.db.Exec(createMetaTable); err != nil {
 		return fmt.Errorf("failed creating etl_metadata/etl_processed_files tables: %w", err)
@@ -445,6 +456,351 @@ func (m *MySQLDriver) insertBatchInsertIgnoreChunk(table schema.TableSpec, rows 
 	}
 
 	return tx.Commit()
+}
+
+// mysqlTrackedTables maps table name to its primary-key column(s), for the
+// subset of tables UpsertBatchTracked actually compares field-by-field
+// against what's already stored, instead of silently skipping duplicates
+// the way plain InsertBatch does.
+//
+// socios is deliberately absent: the RFB layout gives it no single natural
+// unique key today (InitSchema doesn't define a PRIMARY KEY for it either —
+// every existing import already treats it as append-only). Tracking it
+// needs a schema decision — a composite key, plus a dedup pass for whatever
+// duplicates a prior untracked import may already have inserted — that's a
+// separate piece of work from this one.
+var mysqlTrackedTables = map[string][]string{
+	"empresa":         {"cnpj_basico"},
+	"estabelecimento": {"cnpj_basico", "cnpj_ordem", "cnpj_dv"},
+	"simples":         {"cnpj_basico"},
+}
+
+// mysqlNormalizeForCompare mirrors sanitizeValueMySQL's parsing but returns
+// the canonical string form MySQL storage would produce, so a freshly
+// parsed CSV value can be compared directly against a value scanned back
+// from the database (see UpsertBatchTracked). Kept separate from
+// sanitizeValueMySQL — which returns a typed interface{} for driver args —
+// since the two solve different problems even though the parsing is the
+// same.
+func mysqlNormalizeForCompare(val string, colType string) string {
+	val = strings.TrimSpace(val)
+	if val == "" {
+		return ""
+	}
+	switch colType {
+	case "NUMERIC":
+		val = strings.ReplaceAll(val, ",", ".")
+		num, err := strconv.ParseFloat(val, 64)
+		if err != nil {
+			return ""
+		}
+		return strconv.FormatFloat(num, 'f', 2, 64) // matches DECIMAL(15,2) storage
+	case "INTEGER":
+		num, err := strconv.Atoi(val)
+		if err != nil {
+			return ""
+		}
+		return strconv.Itoa(num)
+	default:
+		return val
+	}
+}
+
+type mysqlChange struct {
+	cnpjBasico  string
+	tabela      string
+	campo       string
+	valorAntigo string
+	valorNovo   string
+}
+
+// UpsertBatchTracked behaves like InsertBatch for the tables in
+// mysqlTrackedTables: a genuinely new row (primary key not seen before) is
+// inserted exactly as InsertBatch would; a row whose primary key already
+// exists is compared column-by-column against what's stored, and only
+// UPDATEd — with each changed field recorded in etl_change_log — if at
+// least one column actually differs. Rows that already match are skipped
+// entirely: no UPDATE, no log entry, no write at all. That's what keeps a
+// monthly reimport cheap — most companies don't change from one
+// competência to the next, so most of the batch costs one indexed lookup
+// (mysqlFetchExisting) and nothing else.
+func (m *MySQLDriver) UpsertBatchTracked(table schema.TableSpec, rows [][]string, competencia string) error {
+	pkCols, tracked := mysqlTrackedTables[table.Name]
+	if !tracked || len(rows) == 0 {
+		return m.InsertBatch(table, rows)
+	}
+
+	pkIdx := make([]int, len(pkCols))
+	for i, pkCol := range pkCols {
+		pkIdx[i] = -1
+		for ci, c := range table.Columns {
+			if c.Name == pkCol {
+				pkIdx[i] = ci
+				break
+			}
+		}
+		if pkIdx[i] == -1 {
+			// Defensive: schema and mysqlTrackedTables disagree. Fall back
+			// to the untracked path rather than panic on a bad index.
+			return m.InsertBatch(table, rows)
+		}
+	}
+
+	rowValue := func(row []string, idx int) string {
+		if idx < len(row) {
+			return row[idx]
+		}
+		return ""
+	}
+	keyOf := func(row []string) string {
+		parts := make([]string, len(pkIdx))
+		for i, idx := range pkIdx {
+			parts[i] = rowValue(row, idx)
+		}
+		return strings.Join(parts, "\x1f")
+	}
+
+	existing, err := m.mysqlFetchExisting(table, pkCols, pkIdx, rows)
+	if err != nil {
+		return fmt.Errorf("erro ao buscar linhas existentes de `%s` para comparação: %w", table.Name, err)
+	}
+
+	var newRows [][]string
+	var changedRows [][]string
+	var changes []mysqlChange
+
+	for _, row := range rows {
+		old, found := existing[keyOf(row)]
+		if !found {
+			newRows = append(newRows, row)
+			continue
+		}
+
+		rowChanged := false
+		for ci, col := range table.Columns {
+			newVal := mysqlNormalizeForCompare(rowValue(row, ci), col.Type)
+			if newVal != old[ci] {
+				rowChanged = true
+				changes = append(changes, mysqlChange{
+					cnpjBasico:  rowValue(row, pkIdx[0]), // cnpj_basico is always the first tracked column
+					tabela:      table.Name,
+					campo:       col.Name,
+					valorAntigo: old[ci],
+					valorNovo:   newVal,
+				})
+			}
+		}
+		if rowChanged {
+			changedRows = append(changedRows, row)
+		}
+	}
+
+	if len(newRows) > 0 {
+		if err := m.InsertBatch(table, newRows); err != nil {
+			return fmt.Errorf("erro ao inserir linhas novas de `%s`: %w", table.Name, err)
+		}
+	}
+	if len(changedRows) > 0 {
+		// The UPDATE and its etl_change_log entries must land together: a
+		// row that changed with no matching log entry (or a log entry for a
+		// change that never actually got applied) defeats the entire point
+		// of this feature. Both happen in mysqlApplyChangesTx's single
+		// transaction, not two separate ones.
+		if err := m.mysqlApplyChangesTx(table, pkCols, pkIdx, changedRows, changes, competencia); err != nil {
+			return fmt.Errorf("erro ao aplicar alterações de `%s`: %w", table.Name, err)
+		}
+	}
+
+	return nil
+}
+
+// mysqlFetchExisting looks up which of the batch's rows already exist,
+// returning each found row's columns as canonical comparison strings
+// (mysqlNormalizeForCompare's format), keyed the same way UpsertBatchTracked
+// builds keys. Chunked to stay under MySQL's placeholder ceiling — this is
+// an indexed point lookup (IN on the primary key), not a table scan, so it
+// stays fast regardless of how big the table already is.
+func (m *MySQLDriver) mysqlFetchExisting(table schema.TableSpec, pkCols []string, pkIdx []int, rows [][]string) (map[string][]string, error) {
+	result := make(map[string][]string, len(rows))
+
+	cols := make([]string, len(table.Columns))
+	for i, c := range table.Columns {
+		cols[i] = fmt.Sprintf("`%s`", c.Name)
+	}
+	quotedPK := make([]string, len(pkCols))
+	for i, c := range pkCols {
+		quotedPK[i] = fmt.Sprintf("`%s`", c)
+	}
+
+	chunkSize := placeholderBatchLimit(len(pkCols), m.cfg.BatchSize, 65000)
+
+	for start := 0; start < len(rows); start += chunkSize {
+		end := start + chunkSize
+		if end > len(rows) {
+			end = len(rows)
+		}
+		chunk := rows[start:end]
+
+		var whereClause string
+		args := make([]interface{}, 0, len(chunk)*len(pkCols))
+		if len(pkCols) == 1 {
+			placeholders := make([]string, len(chunk))
+			for i, row := range chunk {
+				placeholders[i] = "?"
+				args = append(args, row[pkIdx[0]])
+			}
+			whereClause = fmt.Sprintf("%s IN (%s)", quotedPK[0], strings.Join(placeholders, ","))
+		} else {
+			tuplePlaceholder := "(" + strings.Repeat("?,", len(pkCols)-1) + "?)"
+			tuples := make([]string, len(chunk))
+			for i, row := range chunk {
+				tuples[i] = tuplePlaceholder
+				for _, idx := range pkIdx {
+					args = append(args, row[idx])
+				}
+			}
+			whereClause = fmt.Sprintf("(%s) IN (%s)", strings.Join(quotedPK, ","), strings.Join(tuples, ","))
+		}
+
+		querySQL := fmt.Sprintf("SELECT %s FROM `%s` WHERE %s", strings.Join(cols, ","), table.Name, whereClause)
+
+		if err := func() error {
+			queryRows, err := m.db.Query(querySQL, args...)
+			if err != nil {
+				return err
+			}
+			defer queryRows.Close()
+
+			scanTargets := make([]sql.NullString, len(table.Columns))
+			scanArgs := make([]interface{}, len(table.Columns))
+			for i := range scanTargets {
+				scanArgs[i] = &scanTargets[i]
+			}
+
+			for queryRows.Next() {
+				if err := queryRows.Scan(scanArgs...); err != nil {
+					return err
+				}
+				values := make([]string, len(table.Columns))
+				for i, ns := range scanTargets {
+					values[i] = ns.String
+				}
+				keyParts := make([]string, len(pkIdx))
+				for pi, idx := range pkIdx {
+					keyParts[pi] = values[idx]
+				}
+				result[strings.Join(keyParts, "\x1f")] = values
+			}
+			return queryRows.Err()
+		}(); err != nil {
+			return nil, err
+		}
+	}
+
+	return result, nil
+}
+
+// mysqlApplyChangesTx applies every UPDATE for rows UpsertBatchTracked
+// determined actually changed, together with all of their etl_change_log
+// entries, inside a single transaction. This must not be two separate
+// transactions: a row updated with no matching log entry (say, because the
+// log insert failed after the update already committed) silently defeats
+// the entire point of this feature — the data changes but nothing explains
+// when or why. Verified live: an early version of this code did split them,
+// and a table-not-found error on the log insert left a real production row
+// changed with no record of it (see git history / commit message for this
+// change).
+func (m *MySQLDriver) mysqlApplyChangesTx(table schema.TableSpec, pkCols []string, pkIdx []int, changedRows [][]string, changes []mysqlChange, competencia string) error {
+	tx, err := m.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	setClauses := make([]string, len(table.Columns))
+	for i, c := range table.Columns {
+		setClauses[i] = fmt.Sprintf("`%s` = ?", c.Name)
+	}
+	whereClauses := make([]string, len(pkCols))
+	for i, c := range pkCols {
+		whereClauses[i] = fmt.Sprintf("`%s` = ?", c)
+	}
+	updateStmtStr := fmt.Sprintf("UPDATE `%s` SET %s WHERE %s", table.Name, strings.Join(setClauses, ", "), strings.Join(whereClauses, " AND "))
+
+	updateStmt, err := tx.Prepare(updateStmtStr)
+	if err != nil {
+		return err
+	}
+	defer updateStmt.Close()
+
+	for _, row := range changedRows {
+		args := make([]interface{}, 0, len(table.Columns)+len(pkCols))
+		for ci, c := range table.Columns {
+			var val string
+			if ci < len(row) {
+				val = row[ci]
+			}
+			args = append(args, sanitizeValueMySQL(val, c.Type))
+		}
+		for _, idx := range pkIdx {
+			args = append(args, row[idx])
+		}
+		if _, err := updateStmt.Exec(args...); err != nil {
+			return err
+		}
+	}
+
+	const chunkSize = 5000 // 6 placeholders/row
+	for start := 0; start < len(changes); start += chunkSize {
+		end := start + chunkSize
+		if end > len(changes) {
+			end = len(changes)
+		}
+		chunk := changes[start:end]
+
+		valueStrings := make([]string, len(chunk))
+		args := make([]interface{}, 0, len(chunk)*6)
+		for i, c := range chunk {
+			valueStrings[i] = "(?, ?, ?, ?, ?, ?)"
+			args = append(args, c.cnpjBasico, c.tabela, c.campo, c.valorAntigo, c.valorNovo, competencia)
+		}
+
+		logSQL := fmt.Sprintf(
+			"INSERT INTO etl_change_log (cnpj_basico, tabela, campo, valor_antigo, valor_novo, competencia) VALUES %s",
+			strings.Join(valueStrings, ","),
+		)
+		if _, err := tx.Exec(logSQL, args...); err != nil {
+			return err
+		}
+	}
+
+	return tx.Commit()
+}
+
+// GetChangeHistory returns every recorded change for a company's
+// cnpj_basico across all tracked tables, newest first.
+func (m *MySQLDriver) GetChangeHistory(cnpjBasico string) ([]ChangeLogEntry, error) {
+	rows, err := m.db.Query(
+		"SELECT tabela, campo, valor_antigo, valor_novo, competencia, detectado_em FROM etl_change_log WHERE cnpj_basico = ? ORDER BY detectado_em DESC, id DESC",
+		cnpjBasico,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	entries := []ChangeLogEntry{}
+	for rows.Next() {
+		var e ChangeLogEntry
+		var antigo, novo sql.NullString
+		if err := rows.Scan(&e.Tabela, &e.Campo, &antigo, &novo, &e.Competencia, &e.DetectadoEm); err != nil {
+			return nil, err
+		}
+		e.ValorAntigo = antigo.String
+		e.ValorNovo = novo.String
+		entries = append(entries, e)
+	}
+	return entries, rows.Err()
 }
 
 // formatValueForLoadData renders a raw CSV field as a LOAD DATA text-format
@@ -770,12 +1126,28 @@ func buildBooleanFulltextQuery(query string) (string, bool) {
 	return strings.Join(parts, " "), true
 }
 
-func (m *MySQLDriver) GetStats() (map[string]interface{}, error) {
-	var totalEmpresas, totalEstab, totalSocios int64
+// mysqlTableRowEstimate reads InnoDB's own row-count estimate from
+// information_schema instead of running COUNT(*). TABLE_ROWS can be off by
+// roughly 10-15% until the next ANALYZE TABLE, but it's a catalog lookup —
+// no table scan — which matters because GetStats backs GET /api/v1/status,
+// something the dashboard polls every 15s. Verified live against MySQL 8.4
+// with 70M+ rows: the exact COUNT(*) this replaced took 30-60s+ per call,
+// and concurrent polling piled up queries faster than any of them could
+// finish, leaving the endpoint permanently unresponsive. An estimate that
+// returns instantly is the right trade-off for a dashboard stat.
+func (m *MySQLDriver) mysqlTableRowEstimate(table string) int64 {
+	var n int64
+	_ = m.db.QueryRow(
+		"SELECT TABLE_ROWS FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?",
+		table,
+	).Scan(&n)
+	return n
+}
 
-	_ = m.db.QueryRow("SELECT COUNT(*) FROM empresa").Scan(&totalEmpresas)
-	_ = m.db.QueryRow("SELECT COUNT(*) FROM estabelecimento").Scan(&totalEstab)
-	_ = m.db.QueryRow("SELECT COUNT(*) FROM socios").Scan(&totalSocios)
+func (m *MySQLDriver) GetStats() (map[string]interface{}, error) {
+	totalEmpresas := m.mysqlTableRowEstimate("empresa")
+	totalEstab := m.mysqlTableRowEstimate("estabelecimento")
+	totalSocios := m.mysqlTableRowEstimate("socios")
 
 	latestMonth, _ := m.GetLatestProcessedMonth()
 

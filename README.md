@@ -187,6 +187,7 @@ cp .env.example .env
 | `cnae`, `motivo_situacao_cadastral`, `municipio`, `natureza_juridica`, `pais`, `qualificacao_socio` | Tabelas de domínio (código → descrição) |
 | `etl_metadata` | Controle da última competência processada |
 | `etl_processed_files` | Controle individual de cada arquivo já importado (garante idempotência) |
+| `etl_change_log` | Histórico de mudanças de campo entre competências (MySQL e Postgres — ver [Performance](#-performance) e `GET /api/v1/cnpj/{cnpj}/historico` em [`docs/API.md`](docs/API.md)) |
 | `vw_cnpj_completo` | View com join pronto de estabelecimento + empresa + simples + domínios |
 
 ## 🖥️ Uso
@@ -227,6 +228,7 @@ O que faz essa engine ser rápida não é um único truque, é a soma de várias
 - **Importação paralela, não sequencial** — até `DOWNLOAD_WORKERS` arquivos são descompactados e carregados no banco ao mesmo tempo, sem lock global entre eles.
 - **`LOAD DATA LOCAL INFILE` no MySQL** — usa o mecanismo nativo de bulk-load do MySQL em vez de `INSERT` em lote, com fallback automático e transparente se o servidor não permitir.
 - **Índices secundários adiados** — criados só depois da carga completa, não a cada `INSERT`, que é o maior fator de lentidão em uma carga em massa do zero.
+- **Upsert com rastreamento de mudanças, não `INSERT IGNORE` cego (MySQL e Postgres)** — a Receita publica um snapshot completo todo mês, não um diff. `UpsertBatchTracked` compara cada linha com o que já está salvo (uma busca indexada pela chave primária, não um scan) e só grava quando algo de fato mudou — empresa sem alteração nenhuma custa só a consulta de comparação, nenhuma escrita. Detalhes e por que isso importa em [Histórico de mudanças](docs/ARCHITECTURE.md#histórico-de-mudanças-upsertbatchtracked). SQLite/ClickHouse ainda caem no `InsertBatch`/`INSERT IGNORE` de sempre (só descarta duplicata, não atualiza nem rastreia).
 - **`ReplacingMergeTree` no ClickHouse** — dedupe em merge, sem overhead de checagem de unicidade por linha.
 - Tempo real de uma carga completa depende muito do hardware do banco e da rede até a Receita Federal — não existe número universal.
 
@@ -313,7 +315,8 @@ Transparência sobre o estado atual do projeto — bom pra quem quiser contribui
 - `SQLite`/`turso`/`duckdb` não têm nenhuma aceleração nativa de busca por nome (`GET /api/v1/busca` faz scan completo nesses drivers sem Meilisearch); habilitar o Meilisearch é a forma recomendada de acelerar a busca nesses drivers.
 - ClickHouse usa `FINAL` nas leituras de `GetCNPJ`/`SearchCNPJ`/`GetStats`/`GetSearchDocuments` para garantir dedupe correto (ver [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)) — corrige um bug real, mas tem custo de performance na leitura em tabelas muito grandes; não foi otimizado além disso.
 - A sincronização com o Meilisearch é uma reindexação completa a cada carga com dados novos, não incremental — simples e correto, mas reprocessa a tabela inteira mesmo que só um arquivo pequeno tenha mudado. Aceitável dado que a Receita Federal só atualiza mensalmente; passaria a valer a pena otimizar se a cadência de atualização mudasse.
-- Nunca foi medido um tempo real de ponta a ponta para uma carga completa em produção — as estimativas de performance no README são por ordem de grandeza, não medição.
+- `UpsertBatchTracked` (upsert real + histórico de mudanças, ver [Histórico de mudanças](docs/ARCHITECTURE.md#histórico-de-mudanças-upsertbatchtracked)) está implementado de verdade para MySQL e Postgres — SQLite e ClickHouse caem no `InsertBatch`/`INSERT IGNORE` de sempre (descarta duplicata em vez de comparar/atualizar). E mesmo em MySQL/Postgres, a tabela `socios` não é rastreada: o layout da Receita não dá uma chave única natural pra ela, e o schema atual nem define `PRIMARY KEY` nessa tabela hoje — precisa de uma decisão de chave composta antes de dar pra rastrear.
+- A validação ao vivo do `UpsertBatchTracked` do Postgres rodou contra um `postgres:15` isolado, criado e destruído só para o teste (dados sintéticos, não o banco de produção do MySQL) — mesma lógica testada, mas não contra um dataset real de 70M+ linhas como o MySQL foi.
 
 ## 📄 Licença
 

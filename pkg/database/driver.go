@@ -3,6 +3,7 @@ package database
 import (
 	"database/sql"
 	"fmt"
+	"time"
 
 	"github.com/leandronunes07/cnpj-rfb/pkg/config"
 	"github.com/leandronunes07/cnpj-rfb/pkg/schema"
@@ -30,6 +31,22 @@ type DBDriver interface {
 	IsFileProcessed(dataMonth string, filename string) (bool, error)
 	SaveProcessedFile(dataMonth string, filename string, status string) error
 	InsertBatch(table schema.TableSpec, rows [][]string) error
+	// UpsertBatchTracked behaves like InsertBatch for tables with a stable
+	// natural key (empresa, estabelecimento, simples): a row whose primary
+	// key doesn't exist yet is inserted exactly as InsertBatch would; a row
+	// whose primary key already exists is compared field-by-field against
+	// what's stored, and only updated (with each changed field recorded,
+	// see GetChangeHistory) if something actually differs. Rows that match
+	// exactly are skipped — no write at all — which is what keeps a monthly
+	// reimport cheap: most companies don't change from one competência to
+	// the next. Tables without tracking support fall back to plain
+	// InsertBatch unchanged (see each driver for which tables it tracks).
+	UpsertBatchTracked(table schema.TableSpec, rows [][]string, competencia string) error
+	// GetChangeHistory returns the field-level changes UpsertBatchTracked
+	// has recorded for a company (matched by its 8-digit cnpj_basico —
+	// shared across all of its establishments), newest first. A driver that
+	// doesn't implement tracking yet returns an empty slice, not an error.
+	GetChangeHistory(cnpjBasico string) ([]ChangeLogEntry, error)
 	GetCNPJ(cnpj string) (map[string]interface{}, error)
 	SearchCNPJ(query string, uf string, limit int) ([]map[string]interface{}, error)
 	GetStats() (map[string]interface{}, error)
@@ -51,6 +68,17 @@ type SearchDocument struct {
 	NomeFantasia string
 	UF           string
 	CNAE         int64
+}
+
+// ChangeLogEntry is one recorded field-level change, produced by
+// UpsertBatchTracked and read back by GetChangeHistory.
+type ChangeLogEntry struct {
+	Tabela      string    `json:"tabela"`
+	Campo       string    `json:"campo"`
+	ValorAntigo string    `json:"valor_antigo"`
+	ValorNovo   string    `json:"valor_novo"`
+	Competencia string    `json:"competencia"`
+	DetectadoEm time.Time `json:"detectado_em"`
 }
 
 func NewDBDriver(cfg *config.Config) (DBDriver, error) {

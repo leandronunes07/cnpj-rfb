@@ -231,6 +231,20 @@ func (s *SQLiteDriver) InsertBatch(table schema.TableSpec, rows [][]string) erro
 	return tx.Commit()
 }
 
+// UpsertBatchTracked falls back to plain InsertBatch — change tracking
+// (etl_change_log-based, matching MySQLDriver.UpsertBatchTracked) isn't
+// implemented for SQLite yet (also inherited as-is by DuckDBDriver, which
+// embeds *SQLiteDriver). Rows still insert correctly, they just won't
+// produce change-log entries or update an existing row's changed fields.
+func (s *SQLiteDriver) UpsertBatchTracked(table schema.TableSpec, rows [][]string, competencia string) error {
+	return s.InsertBatch(table, rows)
+}
+
+// GetChangeHistory returns no history — see UpsertBatchTracked above.
+func (s *SQLiteDriver) GetChangeHistory(cnpjBasico string) ([]ChangeLogEntry, error) {
+	return nil, nil
+}
+
 func (s *SQLiteDriver) GetCNPJ(cleanCNPJ string) (map[string]interface{}, error) {
 	if len(cleanCNPJ) < 14 {
 		return nil, fmt.Errorf("CNPJ deve ter 14 caracteres")

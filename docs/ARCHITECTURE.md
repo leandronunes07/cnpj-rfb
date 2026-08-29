@@ -9,7 +9,7 @@ flowchart TD
     A["pkg/crawler<br/>descobre a competência (YYYY-MM)<br/>e lista os .zip disponíveis"] --> B["pkg/downloader<br/>worker pool (DOWNLOAD_WORKERS)<br/>baixa + retry + skip se já atualizado"]
     B -->|"cada worker processa<br/>o arquivo que baixou"| C["pkg/extractor<br/>descompacta (zip-slip safe)<br/>+ stream CSV ISO-8859-1 → UTF-8"]
     C --> D["pkg/etl.Pipeline<br/>casa arquivo → tabela pelo prefixo<br/>do nome (schema.Tables)"]
-    D --> E["pkg/database.DBDriver<br/>InsertBatch em lote,<br/>uma transação por lote"]
+    D --> E["pkg/database.DBDriver<br/>UpsertBatchTracked em lote,<br/>uma transação por lote"]
     E --> F["EnsureIndexes()<br/>roda uma vez, no fim da carga"]
     F --> J["SyncSearchIndex()<br/>se MEILISEARCH_HOST configurado"]
 
@@ -34,18 +34,45 @@ sequenceDiagram
     W2->>W2: baixa Empresas1.zip
     W1->>W1: extrai + importa Empresas0.zip
     par Import concorrente
-        W1->>DB: InsertBatch (tabela empresa)
+        W1->>DB: UpsertBatchTracked (tabela empresa)
     and
         W2->>W2: extrai + importa Empresas1.zip
-        W2->>DB: InsertBatch (tabela empresa)
+        W2->>DB: UpsertBatchTracked (tabela empresa)
     end
 ```
 
 Isso é seguro porque:
 - `*sql.DB` é seguro para uso concorrente por múltiplas goroutines (é um pool gerenciado pelo driver).
-- Cada `InsertBatch` abre sua própria transação — não há estado mutável compartilhado entre chamadas concorrentes.
+- Cada `UpsertBatchTracked`/`InsertBatch` abre sua própria transação — não há estado mutável compartilhado entre chamadas concorrentes.
 - Cada arquivo é extraído para uma subpasta própria (`ExtractedDir/<nome-do-arquivo>/`), evitando colisão de nomes entre arquivos processados ao mesmo tempo.
 - Bancos com uma única conexão (SQLite, via `db.SetMaxOpenConns(1)`) naturalmente serializam as transações através do próprio pool — sem precisar de nenhum lock explícito no código.
+
+## Histórico de mudanças (`UpsertBatchTracked`)
+
+A Receita Federal publica um **snapshot completo** todo mês, não um diff — o `Empresas0.zip` de setembro tem todas as empresas de novo, não só as que mudaram. Um `INSERT IGNORE`/`ON CONFLICT DO NOTHING` (o que `InsertBatch` sempre fez) trata isso descartando silenciosamente qualquer CNPJ que já existe: só empresas genuinamente novas entram, e uma empresa existente que mudou de endereço, situação cadastral, capital social etc. nunca reflete isso no banco — a linha antiga fica congelada na primeira vez que foi importada.
+
+`UpsertBatchTracked` (interface em `pkg/database.DBDriver`, implementado de verdade para MySQL e Postgres hoje — mesma arquitetura nos dois, só muda o dialeto SQL: `mysqlFetchExisting`/`postgresFetchExisting`, `mysqlApplyChangesTx`/`postgresApplyChangesTx`) resolve isso comparando cada linha recebida com o que já está no banco, ao invés de descartar por padrão:
+
+```mermaid
+flowchart TD
+    A["Lote de linhas do CSV<br/>(StreamCSVRows)"] --> B["*FetchExisting<br/>SELECT por chave primária,<br/>uma consulta indexada, não um scan"]
+    B --> C{"chave já existe?"}
+    C -->|não| D["InsertBatch normal<br/>(LOAD DATA/INSERT IGNORE/ON CONFLICT)"]
+    C -->|sim| E["compara campo a campo<br/>(*NormalizeForCompare)"]
+    E --> F{"algum campo mudou?"}
+    F -->|não| G["nada — nenhuma escrita"]
+    F -->|sim| H["UPDATE + INSERT em etl_change_log<br/>na MESMA transação (*ApplyChangesTx)"]
+```
+
+Pontos de design:
+
+- **Só as tabelas com chave natural estável são rastreadas** — `empresa`, `estabelecimento` (chave composta `cnpj_basico`+`cnpj_ordem`+`cnpj_dv`) e `simples`. `socios` fica de fora: o layout da Receita não dá uma chave única natural pra ela, e o schema atual nem define `PRIMARY KEY` nessa tabela em nenhum dos dois drivers — rastrear mudanças aí exige uma decisão de chave composta e uma migração de dedupe pro que já foi importado sem chave nenhuma. Tabelas de domínio (`cnae`, `municipio`, etc.) e drivers sem `UpsertBatchTracked` implementado (SQLite, ClickHouse) caem de volta pro `InsertBatch` de sempre, sem tracking.
+- **A comparação é uma consulta indexada, não um scan.** `*FetchExisting` faz `SELECT ... WHERE chave IN (...)` contra a chave primária — isso não fica mais lento conforme a tabela cresce, é sempre uma busca por índice.
+- **Linhas idênticas custam só a consulta de comparação — nenhuma escrita.** É isso que mantém uma carga mensal "leve": a maioria das empresas não muda de uma competência pra outra, então a maior parte do lote não gera `UPDATE` nem entrada de log, só o `SELECT` inicial.
+- **UPDATE e log de mudança são atômicos — a mesma transação.** Uma versão inicial disso (no MySQL) fazia as duas coisas em transações separadas; um erro no `INSERT` do log depois do `UPDATE` já commitado deixava o dado mudado **sem nenhum registro do que aconteceu** — verificado ao vivo (um `Table doesn't exist` no log chegou a alterar de verdade uma linha de produção antes de ser corrigido). `*ApplyChangesTx` (MySQL e Postgres, desde o início nesse último) faz as duas coisas numa transação só: ou os dois acontecem, ou nenhum acontece.
+- **A comparação usa a mesma normalização do insert** (`*NormalizeForCompare` espelha `sanitizeValueMySQL`/`sanitizeValuePostgres`): vírgula vira ponto em `NUMERIC`, formata com 2 casas decimais pra bater com o que `DECIMAL(15,2)`/`NUMERIC(15,2)` de fato armazenam, e trata string vazia como `NULL` dos dois lados. Sem isso, diferenças de formatação (não de conteúdo) gerariam entradas de log falsas todo mês.
+- **Histórico é por `cnpj_basico`, não por CNPJ completo** — `etl_change_log.cnpj_basico` tem só os 8 dígitos, compartilhados entre `empresa` e todos os `estabelecimento`/filiais daquele CNPJ. `GET /api/v1/cnpj/{cnpj}/historico` (ver [`docs/API.md`](API.md)) consulta por esse prefixo.
+- **A validação do Postgres rodou contra uma instância `postgres:15` isolada** (criada e destruída só para o teste, dados sintéticos), cobrindo os mesmos casos do MySQL (linha nova, reimport sem mudança, mudança em tabela de chave simples e em chave composta) — mas não contra um dataset real de dezenas de milhões de linhas como o MySQL foi.
 
 ## Pacotes
 
@@ -57,7 +84,7 @@ Isso é seguro porque:
 | `pkg/downloader` | Worker pool de download HTTP com retry exponencial simples e skip por `Content-Length` (não baixa de novo se o arquivo local já bate com o remoto). |
 | `pkg/extractor` | Extrai `.zip` (com proteção contra zip-slip) e faz streaming de CSV, decodificando `ISO-8859-1` → `UTF-8` linha a linha via `csv.Reader`. |
 | `pkg/schema` | Define as tabelas/colunas do domínio (`schema.Tables`) — usado tanto para gerar o DDL de cada driver quanto para casar um arquivo extraído com sua tabela de destino pelo prefixo do nome. |
-| `pkg/database` | Interface `DBDriver` + implementações concretas (Postgres, MySQL, SQLite, ClickHouse). Cada driver decide seu próprio `BatchLimit` e como criar índices via `EnsureIndexes`. |
+| `pkg/database` | Interface `DBDriver` + implementações concretas (Postgres, MySQL, SQLite, ClickHouse). Cada driver decide seu próprio `BatchLimit`, como criar índices via `EnsureIndexes`, e se `UpsertBatchTracked` de fato compara/rastreia mudanças ou só cai pro `InsertBatch` de sempre (MySQL e Postgres rastreiam hoje, SQLite/ClickHouse ainda não — ver [Histórico de mudanças](#histórico-de-mudanças-upsertbatchtracked)). |
 | `pkg/etl` | Orquestra crawler → downloader → extractor → database em `Pipeline.Run()`; dono do lock de execução única. |
 | `pkg/api` | Servidor HTTP: middleware de autenticação, handlers REST, broadcaster de Server-Sent Events para o console de logs do dashboard. |
 | `pkg/web` | Dashboard estático (HTML/CSS/JS) embutido no binário via `go:embed` — não depende de arquivos externos em produção. |

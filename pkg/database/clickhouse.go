@@ -219,6 +219,23 @@ func (c *ClickHouseDriver) InsertBatch(table schema.TableSpec, rows [][]string) 
 	return tx.Commit()
 }
 
+// UpsertBatchTracked falls back to plain InsertBatch — change tracking
+// (etl_change_log-based, matching MySQLDriver.UpsertBatchTracked) isn't
+// implemented for ClickHouse yet. Unlike the other drivers this one doesn't
+// need it as urgently for "does a re-import update existing data": its
+// ReplacingMergeTree engine already favors the most recently inserted row
+// for a given key on merge/FINAL, so a monthly reimport naturally reflects
+// changed fields — it just doesn't produce a queryable change-log entry
+// explaining what changed or when.
+func (c *ClickHouseDriver) UpsertBatchTracked(table schema.TableSpec, rows [][]string, competencia string) error {
+	return c.InsertBatch(table, rows)
+}
+
+// GetChangeHistory returns no history — see UpsertBatchTracked above.
+func (c *ClickHouseDriver) GetChangeHistory(cnpjBasico string) ([]ChangeLogEntry, error) {
+	return nil, nil
+}
+
 func (c *ClickHouseDriver) GetCNPJ(cleanCNPJ string) (map[string]interface{}, error) {
 	if len(cleanCNPJ) < 14 {
 		return nil, fmt.Errorf("CNPJ deve ter 14 caracteres")

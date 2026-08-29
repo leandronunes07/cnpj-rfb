@@ -84,7 +84,18 @@ func (p *PostgresDriver) InitSchema() error {
 		filename VARCHAR(255) NOT NULL,
 		status VARCHAR(32) NOT NULL,
 		processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-	);`
+	);
+	CREATE TABLE IF NOT EXISTS etl_change_log (
+		id BIGSERIAL PRIMARY KEY,
+		cnpj_basico VARCHAR(8) NOT NULL,
+		tabela VARCHAR(32) NOT NULL,
+		campo VARCHAR(64) NOT NULL,
+		valor_antigo TEXT,
+		valor_novo TEXT,
+		competencia VARCHAR(7) NOT NULL,
+		detectado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+	);
+	CREATE INDEX IF NOT EXISTS idx_change_log_cnpj ON etl_change_log(cnpj_basico);`
 	if _, err := p.db.Exec(createMetaTable); err != nil {
 		return fmt.Errorf("failed creating etl_metadata/etl_processed_files tables: %w", err)
 	}
@@ -276,6 +287,322 @@ func (p *PostgresDriver) InsertBatch(table schema.TableSpec, rows [][]string) er
 	return tx.Commit()
 }
 
+// postgresTrackedTables mirrors mysqlTrackedTables — see that comment in
+// mysql.go for why socios is deliberately absent.
+var postgresTrackedTables = map[string][]string{
+	"empresa":         {"cnpj_basico"},
+	"estabelecimento": {"cnpj_basico", "cnpj_ordem", "cnpj_dv"},
+	"simples":         {"cnpj_basico"},
+}
+
+// postgresNormalizeForCompare mirrors mysqlNormalizeForCompare — same
+// parsing as sanitizeValuePostgres, but returns the canonical string form
+// NUMERIC(15,2)/INTEGER storage would produce, comparable directly against
+// a value scanned back from the database.
+func postgresNormalizeForCompare(val string, colType string) string {
+	val = strings.TrimSpace(val)
+	if val == "" {
+		return ""
+	}
+	switch colType {
+	case "NUMERIC":
+		val = strings.ReplaceAll(val, ",", ".")
+		num, err := strconv.ParseFloat(val, 64)
+		if err != nil {
+			return ""
+		}
+		return strconv.FormatFloat(num, 'f', 2, 64) // matches NUMERIC(15,2) storage
+	case "INTEGER":
+		num, err := strconv.Atoi(val)
+		if err != nil {
+			return ""
+		}
+		return strconv.Itoa(num)
+	default:
+		return val
+	}
+}
+
+type postgresChange struct {
+	cnpjBasico  string
+	tabela      string
+	campo       string
+	valorAntigo string
+	valorNovo   string
+}
+
+// UpsertBatchTracked mirrors MySQLDriver.UpsertBatchTracked: a genuinely
+// new row (primary key not seen before) is inserted exactly as InsertBatch
+// would; a row whose primary key already exists is compared column-by-
+// column against what's stored, and only UPDATEd — with each changed field
+// recorded in etl_change_log — if at least one column actually differs.
+// See mysql.go's UpsertBatchTracked for the full design rationale (same
+// architecture, only the SQL dialect differs).
+func (p *PostgresDriver) UpsertBatchTracked(table schema.TableSpec, rows [][]string, competencia string) error {
+	pkCols, tracked := postgresTrackedTables[table.Name]
+	if !tracked || len(rows) == 0 {
+		return p.InsertBatch(table, rows)
+	}
+
+	pkIdx := make([]int, len(pkCols))
+	for i, pkCol := range pkCols {
+		pkIdx[i] = -1
+		for ci, c := range table.Columns {
+			if c.Name == pkCol {
+				pkIdx[i] = ci
+				break
+			}
+		}
+		if pkIdx[i] == -1 {
+			return p.InsertBatch(table, rows)
+		}
+	}
+
+	rowValue := func(row []string, idx int) string {
+		if idx < len(row) {
+			return row[idx]
+		}
+		return ""
+	}
+	keyOf := func(row []string) string {
+		parts := make([]string, len(pkIdx))
+		for i, idx := range pkIdx {
+			parts[i] = rowValue(row, idx)
+		}
+		return strings.Join(parts, "\x1f")
+	}
+
+	existing, err := p.postgresFetchExisting(table, pkCols, pkIdx, rows)
+	if err != nil {
+		return fmt.Errorf("erro ao buscar linhas existentes de %s para comparação: %w", table.Name, err)
+	}
+
+	var newRows [][]string
+	var changedRows [][]string
+	var changes []postgresChange
+
+	for _, row := range rows {
+		old, found := existing[keyOf(row)]
+		if !found {
+			newRows = append(newRows, row)
+			continue
+		}
+
+		rowChanged := false
+		for ci, col := range table.Columns {
+			newVal := postgresNormalizeForCompare(rowValue(row, ci), col.Type)
+			if newVal != old[ci] {
+				rowChanged = true
+				changes = append(changes, postgresChange{
+					cnpjBasico:  rowValue(row, pkIdx[0]),
+					tabela:      table.Name,
+					campo:       col.Name,
+					valorAntigo: old[ci],
+					valorNovo:   newVal,
+				})
+			}
+		}
+		if rowChanged {
+			changedRows = append(changedRows, row)
+		}
+	}
+
+	if len(newRows) > 0 {
+		if err := p.InsertBatch(table, newRows); err != nil {
+			return fmt.Errorf("erro ao inserir linhas novas de %s: %w", table.Name, err)
+		}
+	}
+	if len(changedRows) > 0 {
+		// UPDATE and its etl_change_log entries land in one transaction —
+		// see mysql.go's mysqlApplyChangesTx for why splitting them is
+		// unsafe (verified live, corrupted real data before being caught).
+		if err := p.postgresApplyChangesTx(table, pkCols, pkIdx, changedRows, changes, competencia); err != nil {
+			return fmt.Errorf("erro ao aplicar alterações de %s: %w", table.Name, err)
+		}
+	}
+
+	return nil
+}
+
+// postgresFetchExisting mirrors mysqlFetchExisting — an indexed lookup by
+// primary key, chunked to stay under Postgres's placeholder ceiling.
+func (p *PostgresDriver) postgresFetchExisting(table schema.TableSpec, pkCols []string, pkIdx []int, rows [][]string) (map[string][]string, error) {
+	result := make(map[string][]string, len(rows))
+
+	cols := make([]string, len(table.Columns))
+	for i, c := range table.Columns {
+		cols[i] = c.Name
+	}
+
+	chunkSize := placeholderBatchLimit(len(pkCols), p.cfg.BatchSize, 65000)
+
+	for start := 0; start < len(rows); start += chunkSize {
+		end := start + chunkSize
+		if end > len(rows) {
+			end = len(rows)
+		}
+		chunk := rows[start:end]
+
+		var whereClause string
+		args := make([]interface{}, 0, len(chunk)*len(pkCols))
+		paramPos := 1
+		if len(pkCols) == 1 {
+			placeholders := make([]string, len(chunk))
+			for i, row := range chunk {
+				placeholders[i] = fmt.Sprintf("$%d", paramPos)
+				paramPos++
+				args = append(args, row[pkIdx[0]])
+			}
+			whereClause = fmt.Sprintf("%s IN (%s)", pkCols[0], strings.Join(placeholders, ","))
+		} else {
+			tuples := make([]string, len(chunk))
+			for i, row := range chunk {
+				placeholders := make([]string, len(pkCols))
+				for j, idx := range pkIdx {
+					placeholders[j] = fmt.Sprintf("$%d", paramPos)
+					paramPos++
+					args = append(args, row[idx])
+				}
+				tuples[i] = "(" + strings.Join(placeholders, ",") + ")"
+			}
+			whereClause = fmt.Sprintf("(%s) IN (%s)", strings.Join(pkCols, ","), strings.Join(tuples, ","))
+		}
+
+		querySQL := fmt.Sprintf("SELECT %s FROM %s WHERE %s", strings.Join(cols, ","), table.Name, whereClause)
+
+		if err := func() error {
+			queryRows, err := p.db.Query(querySQL, args...)
+			if err != nil {
+				return err
+			}
+			defer queryRows.Close()
+
+			scanTargets := make([]sql.NullString, len(table.Columns))
+			scanArgs := make([]interface{}, len(table.Columns))
+			for i := range scanTargets {
+				scanArgs[i] = &scanTargets[i]
+			}
+
+			for queryRows.Next() {
+				if err := queryRows.Scan(scanArgs...); err != nil {
+					return err
+				}
+				values := make([]string, len(table.Columns))
+				for i, ns := range scanTargets {
+					values[i] = ns.String
+				}
+				keyParts := make([]string, len(pkIdx))
+				for pi, idx := range pkIdx {
+					keyParts[pi] = values[idx]
+				}
+				result[strings.Join(keyParts, "\x1f")] = values
+			}
+			return queryRows.Err()
+		}(); err != nil {
+			return nil, err
+		}
+	}
+
+	return result, nil
+}
+
+// postgresApplyChangesTx mirrors mysqlApplyChangesTx — the UPDATE for every
+// changed row and all of its etl_change_log entries in a single
+// transaction, so the two can never land inconsistently with each other.
+func (p *PostgresDriver) postgresApplyChangesTx(table schema.TableSpec, pkCols []string, pkIdx []int, changedRows [][]string, changes []postgresChange, competencia string) error {
+	tx, err := p.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	setClauses := make([]string, len(table.Columns))
+	for i, c := range table.Columns {
+		setClauses[i] = fmt.Sprintf("%s = $%d", c.Name, i+1)
+	}
+	whereClauses := make([]string, len(pkCols))
+	for i := range pkCols {
+		whereClauses[i] = fmt.Sprintf("%s = $%d", pkCols[i], len(table.Columns)+i+1)
+	}
+	updateStmtStr := fmt.Sprintf("UPDATE %s SET %s WHERE %s", table.Name, strings.Join(setClauses, ", "), strings.Join(whereClauses, " AND "))
+
+	updateStmt, err := tx.Prepare(updateStmtStr)
+	if err != nil {
+		return err
+	}
+	defer updateStmt.Close()
+
+	for _, row := range changedRows {
+		args := make([]interface{}, 0, len(table.Columns)+len(pkCols))
+		for ci, c := range table.Columns {
+			var val string
+			if ci < len(row) {
+				val = row[ci]
+			}
+			args = append(args, sanitizeValuePostgres(val, c.Type))
+		}
+		for _, idx := range pkIdx {
+			args = append(args, row[idx])
+		}
+		if _, err := updateStmt.Exec(args...); err != nil {
+			return err
+		}
+	}
+
+	const chunkSize = 5000 // 6 placeholders/row
+	for start := 0; start < len(changes); start += chunkSize {
+		end := start + chunkSize
+		if end > len(changes) {
+			end = len(changes)
+		}
+		chunk := changes[start:end]
+
+		valueStrings := make([]string, len(chunk))
+		args := make([]interface{}, 0, len(chunk)*6)
+		for i, c := range chunk {
+			base := i * 6
+			valueStrings[i] = fmt.Sprintf("($%d, $%d, $%d, $%d, $%d, $%d)", base+1, base+2, base+3, base+4, base+5, base+6)
+			args = append(args, c.cnpjBasico, c.tabela, c.campo, c.valorAntigo, c.valorNovo, competencia)
+		}
+
+		logSQL := fmt.Sprintf(
+			"INSERT INTO etl_change_log (cnpj_basico, tabela, campo, valor_antigo, valor_novo, competencia) VALUES %s",
+			strings.Join(valueStrings, ","),
+		)
+		if _, err := tx.Exec(logSQL, args...); err != nil {
+			return err
+		}
+	}
+
+	return tx.Commit()
+}
+
+// GetChangeHistory returns every recorded change for a company's
+// cnpj_basico across all tracked tables, newest first.
+func (p *PostgresDriver) GetChangeHistory(cnpjBasico string) ([]ChangeLogEntry, error) {
+	rows, err := p.db.Query(
+		"SELECT tabela, campo, valor_antigo, valor_novo, competencia, detectado_em FROM etl_change_log WHERE cnpj_basico = $1 ORDER BY detectado_em DESC, id DESC",
+		cnpjBasico,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	entries := []ChangeLogEntry{}
+	for rows.Next() {
+		var e ChangeLogEntry
+		var antigo, novo sql.NullString
+		if err := rows.Scan(&e.Tabela, &e.Campo, &antigo, &novo, &e.Competencia, &e.DetectadoEm); err != nil {
+			return nil, err
+		}
+		e.ValorAntigo = antigo.String
+		e.ValorNovo = novo.String
+		entries = append(entries, e)
+	}
+	return entries, rows.Err()
+}
+
 func (p *PostgresDriver) GetCNPJ(cleanCNPJ string) (map[string]interface{}, error) {
 	if len(cleanCNPJ) < 14 {
 		return nil, fmt.Errorf("CNPJ deve ter 14 caracteres")
@@ -399,12 +726,29 @@ func (p *PostgresDriver) SearchCNPJ(query string, uf string, limit int) ([]map[s
 	return results, nil
 }
 
-func (p *PostgresDriver) GetStats() (map[string]interface{}, error) {
-	var totalEmpresas, totalEstab, totalSocios int64
+// postgresTableRowEstimate reads Postgres's own planner estimate
+// (pg_class.reltuples, refreshed by autovacuum/ANALYZE) instead of running
+// COUNT(*), which is always a full sequential/index scan in Postgres — there
+// is no shortcut for an exact count. See the identical trade-off explained
+// on MySQLDriver.mysqlTableRowEstimate: GetStats backs GET /api/v1/status,
+// polled every 15s by the dashboard, so an instant estimate is worth more
+// here than exactness.
+func (p *PostgresDriver) postgresTableRowEstimate(table string) int64 {
+	var n int64
+	_ = p.db.QueryRow(
+		"SELECT reltuples::bigint FROM pg_class WHERE relname = $1",
+		table,
+	).Scan(&n)
+	if n < 0 {
+		return 0
+	}
+	return n
+}
 
-	_ = p.db.QueryRow("SELECT COUNT(*) FROM empresa").Scan(&totalEmpresas)
-	_ = p.db.QueryRow("SELECT COUNT(*) FROM estabelecimento").Scan(&totalEstab)
-	_ = p.db.QueryRow("SELECT COUNT(*) FROM socios").Scan(&totalSocios)
+func (p *PostgresDriver) GetStats() (map[string]interface{}, error) {
+	totalEmpresas := p.postgresTableRowEstimate("empresa")
+	totalEstab := p.postgresTableRowEstimate("estabelecimento")
+	totalSocios := p.postgresTableRowEstimate("socios")
 
 	latestMonth, _ := p.GetLatestProcessedMonth()
 

@@ -140,6 +140,45 @@ Erros:
 
 ---
 
+## `GET /api/v1/cnpj/{cnpj}/historico`
+
+Histórico de mudanças de campo detectadas entre uma competência e a seguinte — quando a Receita publica um mês novo, a carga compara cada empresa com o que já estava salvo e grava só o que realmente mudou (ver [`docs/ARCHITECTURE.md`](ARCHITECTURE.md#histórico-de-mudanças-upsertbatchtracked)). Aceita o mesmo formato de CNPJ que `GET /api/v1/cnpj/{cnpj}` (com ou sem máscara); o histórico é por **cnpj_basico** (os 8 primeiros dígitos — a empresa em si), compartilhado entre todos os estabelecimentos/filiais dela.
+
+```bash
+curl -H "X-API-Token: $API_TOKEN" http://localhost:8080/api/v1/cnpj/00000000000191/historico
+```
+
+```json
+{
+  "cnpj_basico": "00000000",
+  "total_count": 2,
+  "mudancas": [
+    {
+      "tabela": "empresa",
+      "campo": "capital_social",
+      "valor_antigo": "126000000000.00",
+      "valor_novo": "140000000000.00",
+      "competencia": "2026-09",
+      "detectado_em": "2026-09-03T10:15:22Z"
+    },
+    {
+      "tabela": "estabelecimento",
+      "campo": "situacao_cadastral",
+      "valor_antigo": "1",
+      "valor_novo": "2",
+      "competencia": "2026-08",
+      "detectado_em": "2026-08-22T20:41:39Z"
+    }
+  ]
+}
+```
+
+**Só populado para MySQL e Postgres hoje** (`source` não aparece aqui — só há um motor). SQLite e ClickHouse sempre respondem `"mudancas": [], "total_count": 0`, mesmo que a empresa tenha mudado de fato — o mecanismo de comparação (`UpsertBatchTracked`) ainda não foi implementado para esses drivers, ver [`docs/ARCHITECTURE.md`](ARCHITECTURE.md#histórico-de-mudanças-upsertbatchtracked). Nunca retorna `404`: uma empresa sem histórico (nunca mudou desde que o recurso existe, ou é a primeira carga) simplesmente vem com `"mudancas": []`.
+
+`400 Bad Request` nos mesmos casos de `GET /api/v1/cnpj/{cnpj}`.
+
+---
+
 ## `GET /api/v1/busca`
 
 Busca por razão social / nome fantasia, com filtro opcional de UF.

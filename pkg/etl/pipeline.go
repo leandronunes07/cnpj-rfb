@@ -174,7 +174,7 @@ func (p *Pipeline) Run() error {
 
 			matchedCount++
 			log.Printf("[ETL Pipeline] Importando dados de %s para a tabela `%s`...", baseName, tableSpec.Name)
-			if err := p.importFileToTable(extFile, *tableSpec); err != nil {
+			if err := p.importFileToTable(extFile, *tableSpec, targetMonth); err != nil {
 				log.Printf("[ETL Pipeline] ERRO ao importar %s para `%s`: %v", baseName, tableSpec.Name, err)
 				fileImportSuccess = false
 			}
@@ -292,7 +292,7 @@ func (p *Pipeline) SyncSearchIndex() {
 	log.Printf("[Search] Índice de busca sincronizado: %d registros em %v.", total, time.Since(start))
 }
 
-func (p *Pipeline) importFileToTable(filePath string, table schema.TableSpec) error {
+func (p *Pipeline) importFileToTable(filePath string, table schema.TableSpec, competencia string) error {
 	var batch [][]string
 	totalRows := 0
 
@@ -300,10 +300,16 @@ func (p *Pipeline) importFileToTable(filePath string, table schema.TableSpec) er
 	// Postgres/SQLite, ausência desse limite para LOAD DATA no MySQL, etc.)
 	batchLimit := p.db.BatchLimit(len(table.Columns))
 
+	// UpsertBatchTracked, not InsertBatch: for tables with a stable natural
+	// key (empresa/estabelecimento/simples, see mysql.go) this detects rows
+	// that changed since a previous competência and records what changed,
+	// instead of silently discarding them like a plain re-import would.
+	// Other tables/drivers fall back to the old InsertBatch behavior
+	// transparently — see each driver's UpsertBatchTracked.
 	err := p.extractor.StreamCSVRows(filePath, func(row []string) error {
 		batch = append(batch, row)
 		if len(batch) >= batchLimit {
-			if err := p.db.InsertBatch(table, batch); err != nil {
+			if err := p.db.UpsertBatchTracked(table, batch, competencia); err != nil {
 				return err
 			}
 			totalRows += len(batch)
@@ -318,7 +324,7 @@ func (p *Pipeline) importFileToTable(filePath string, table schema.TableSpec) er
 
 	// Insert remaining rows in final batch
 	if len(batch) > 0 {
-		if err := p.db.InsertBatch(table, batch); err != nil {
+		if err := p.db.UpsertBatchTracked(table, batch, competencia); err != nil {
 			return err
 		}
 		totalRows += len(batch)

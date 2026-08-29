@@ -9,6 +9,8 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/leandronunes07/cnpj-rfb/pkg/config"
 	"github.com/leandronunes07/cnpj-rfb/pkg/database"
@@ -24,6 +26,13 @@ type APIHandler struct {
 	pipeline     *etl.Pipeline
 	rateLimiter  *RateLimiter   // nil when Redis isn't configured — rate limiting is then simply skipped
 	searchClient *search.Client // nil when Meilisearch isn't configured — HandleSearch then always uses SQL
+
+	// statsMu guards statsCache/statsCachedAt and is held for the whole
+	// duration of a cache-miss GetStats() call (not just the map access) —
+	// see cachedStats for why that matters.
+	statsMu       sync.Mutex
+	statsCache    map[string]interface{}
+	statsCachedAt time.Time
 }
 
 func NewAPIHandler(cfg *config.Config, db database.DBDriver, pipeline *etl.Pipeline, rateLimiter *RateLimiter, searchClient *search.Client) *APIHandler {
@@ -34,6 +43,37 @@ func NewAPIHandler(cfg *config.Config, db database.DBDriver, pipeline *etl.Pipel
 		rateLimiter:  rateLimiter,
 		searchClient: searchClient,
 	}
+}
+
+// statsCacheTTL bounds how often GET /api/v1/status actually hits the
+// database. GetStats runs a handful of COUNT(*) queries that are full table
+// scans on the driver's biggest tables — verified live against MySQL 8.4
+// with 70M+ rows: 30-60s+ each. The dashboard polls this endpoint every 15s
+// on its own; without a cache, overlapping polls (multiple tabs, or a slow
+// query outliving the next poll) stack up concurrent COUNT(*) queries faster
+// than any of them finish, and the endpoint effectively never responds
+// (reproduced live: 7 queries piled up, none returning). cachedStats holds
+// statsMu for the entire cache-miss fetch, not just the map read/write, so
+// concurrent callers during a refresh queue up behind the one real query
+// instead of each starting their own.
+const statsCacheTTL = 30 * time.Second
+
+func (h *APIHandler) cachedStats() (map[string]interface{}, error) {
+	h.statsMu.Lock()
+	defer h.statsMu.Unlock()
+
+	if h.statsCache != nil && time.Since(h.statsCachedAt) < statsCacheTTL {
+		return h.statsCache, nil
+	}
+
+	stats, err := h.db.GetStats()
+	if err != nil {
+		return nil, err
+	}
+
+	h.statsCache = stats
+	h.statsCachedAt = time.Now()
+	return h.statsCache, nil
 }
 
 func (h *APIHandler) AuthMiddleware(next http.HandlerFunc) http.HandlerFunc {
@@ -111,6 +151,11 @@ func (h *APIHandler) HandleGetCNPJ(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if len(parts) >= 5 && parts[4] == "historico" {
+		h.handleCNPJHistory(w, cleanCNPJ)
+		return
+	}
+
 	cnpjData, err := h.db.GetCNPJ(cleanCNPJ)
 	if err != nil {
 		w.WriteHeader(http.StatusNotFound)
@@ -119,6 +164,29 @@ func (h *APIHandler) HandleGetCNPJ(w http.ResponseWriter, r *http.Request) {
 	}
 
 	json.NewEncoder(w).Encode(cnpjData)
+}
+
+// handleCNPJHistory backs GET /api/v1/cnpj/{cnpj}/historico. Changes are
+// recorded per cnpj_basico (the first 8 digits — the company itself,
+// shared by every one of its establishments/filiais), not per full 14-digit
+// CNPJ, so this looks up by that prefix. Only populated for drivers that
+// implement real change tracking (MySQL today, see pkg/database) — others
+// return an empty list, not an error.
+func (h *APIHandler) handleCNPJHistory(w http.ResponseWriter, cleanCNPJ string) {
+	cnpjBasico := cleanCNPJ[:8]
+
+	history, err := h.db.GetChangeHistory(cnpjBasico)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"cnpj_basico": cnpjBasico,
+		"total_count": len(history),
+		"mudancas":    history,
+	})
 }
 
 func (h *APIHandler) HandleSearch(w http.ResponseWriter, r *http.Request) {
@@ -190,7 +258,7 @@ func (h *APIHandler) search(query, uf string, limit int) ([]map[string]interface
 func (h *APIHandler) HandleStatus(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
-	stats, err := h.db.GetStats()
+	stats, err := h.cachedStats()
 	if err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
 		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
