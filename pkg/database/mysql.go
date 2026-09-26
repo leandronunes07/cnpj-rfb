@@ -112,7 +112,7 @@ var mysqlColumnTypeOverrides = map[string]string{
 	"tipo_logradouro":             "VARCHAR(20)",
 	"logradouro":                  "VARCHAR(100)",
 	"numero":                      "VARCHAR(10)",
-	"complemento":                 "VARCHAR(120)",
+	"complemento":                 "VARCHAR(255)",
 	"bairro":                      "VARCHAR(60)",
 	"cep":                         "VARCHAR(8)",
 	"ddd_1":                       "VARCHAR(4)",
@@ -633,6 +633,9 @@ func (m *MySQLDriver) mysqlFetchExisting(table schema.TableSpec, pkCols []string
 	}
 
 	chunkSize := placeholderBatchLimit(len(pkCols), m.cfg.BatchSize, 65000)
+	if len(pkCols) > 1 && chunkSize > 1000 {
+		chunkSize = 1000
+	}
 
 	for start := 0; start < len(rows); start += chunkSize {
 		end := start + chunkSize

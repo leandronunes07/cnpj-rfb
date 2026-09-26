@@ -26,6 +26,7 @@ type Config struct {
 	BaseURL         string
 	DataMonth       string
 	DownloadWorkers int
+	ImportWorkers   int
 	BatchSize       int
 	AutoCleanup     bool
 	CronSchedule    string
@@ -108,7 +109,8 @@ func LoadConfig() (*Config, error) {
 		ExtractedDir:    filepath.Clean(extractedDir),
 		BaseURL:         baseURL,
 		DataMonth:       getEnv("DATA_MONTH", ""),
-		DownloadWorkers: getEnvAsInt("DOWNLOAD_WORKERS", 4),
+		DownloadWorkers: getEnvAsInt("DOWNLOAD_WORKERS", 2),
+		ImportWorkers:   getEnvAsInt("IMPORT_WORKERS", 4),
 		BatchSize:       getEnvAsInt("BATCH_SIZE", 10000),
 		AutoCleanup:     getEnvAsBool("AUTO_CLEANUP", true),
 		CronSchedule:    getEnv("CRON_SCHEDULE", "0 3 * * *"),

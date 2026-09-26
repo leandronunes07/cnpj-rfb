@@ -20,24 +20,27 @@ flowchart TD
 
 Boot, cron e trigger manual da API podem, em teoria, disparar `Pipeline.Run()` ao mesmo tempo — `pkg/lock` garante que só uma execução roda por vez; as demais são recusadas com um log explicativo em vez de rodar em paralelo e disputar os mesmos arquivos. Ver [Lock de execução do pipeline](#lock-de-execução-do-pipeline-pkglock) abaixo.
 
-## Paralelismo dentro de uma execução
+## Paralelismo dentro de uma execução (Produtor-Consumidor Desacoplado)
 
-Diferente de uma primeira leitura ingênua do código, o download **não** termina antes da importação começar. `Downloader.DownloadStream` mantém um pool de `DOWNLOAD_WORKERS` goroutines lendo de um canal de tarefas; assim que um worker termina de baixar seu arquivo, ele mesmo o descompacta e importa, sem lock global entre workers:
+O download **não** bloqueia a importação, e as taxas de processamento são desacopladas:
+- **`DOWNLOAD_WORKERS` (X)**: pool dedicado a baixar arquivos da Receita Federal em ritmo seguro (evitando bloqueios por WAF/firewall da Receita). Conforme cada `.zip` é concluído, ele é despachado para uma fila intermediária (canal Go com buffer).
+- **`IMPORT_WORKERS` (Y)**: pool dedicado a consumir os arquivos prontos da fila, descompactando, transmitindo CSV em lotes (`BATCH_SIZE`) para o banco e acionando auto-cleanup imediatamente.
 
 ```mermaid
 sequenceDiagram
-    participant W1 as Worker 1
-    participant W2 as Worker 2
+    participant DW as Download Workers (X)
+    participant Q as Fila (Canal de .zip baixados)
+    participant IW as Import Workers (Y)
     participant DB as Banco de Dados
 
-    W1->>W1: baixa Empresas0.zip
-    W2->>W2: baixa Empresas1.zip
-    W1->>W1: extrai + importa Empresas0.zip
+    DW->>DW: Baixa Empresas0.zip
+    DW->>Q: Envia Empresas0.zip baixado
     par Import concorrente
-        W1->>DB: UpsertBatchTracked (tabela empresa)
-    and
-        W2->>W2: extrai + importa Empresas1.zip
-        W2->>DB: UpsertBatchTracked (tabela empresa)
+        Q->>IW: Consome Empresas0.zip
+        IW->>DB: UpsertBatchTracked (lotes de registros)
+    and Download continua
+        DW->>DW: Baixa Empresas1.zip
+        DW->>Q: Envia Empresas1.zip baixado
     end
 ```
 

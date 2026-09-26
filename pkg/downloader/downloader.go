@@ -19,16 +19,18 @@ type Downloader struct {
 }
 
 func NewDownloader(workers int, authToken string) *Downloader {
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+	tr.ResponseHeaderTimeout = 2 * time.Minute
+	tr.IdleConnTimeout = 3 * time.Minute
+	tr.TLSHandshakeTimeout = 30 * time.Second
+	tr.MaxIdleConnsPerHost = 10
+
 	return &Downloader{
 		Workers:   workers,
 		AuthToken: authToken,
 		HTTPClient: &http.Client{
-			Timeout: 2 * time.Hour, // Aumentado para 2 horas para permitir o download completo de arquivos grandes (1.5GB+) em conexões mais lentas
-			Transport: &http.Transport{
-				ResponseHeaderTimeout: 2 * time.Minute,
-				IdleConnTimeout:       3 * time.Minute,
-				TLSHandshakeTimeout:   30 * time.Second,
-			},
+			Timeout:   2 * time.Hour, // Aumentado para 2 horas para permitir o download completo de arquivos grandes (1.5GB+) em conexões mais lentas
+			Transport: tr,
 		},
 	}
 }
@@ -41,6 +43,60 @@ type DownloadTask struct {
 
 func (d *Downloader) DownloadAll(tasks []DownloadTask) error {
 	return d.DownloadStream(tasks, nil)
+}
+
+// DownloadStreamToChannel downloads tasks using d.Workers concurrent workers.
+// As each task finishes downloading, it is passed to outChan.
+// It closes outChan when all downloads have finished.
+func (d *Downloader) DownloadStreamToChannel(tasks []DownloadTask, outChan chan<- DownloadTask) error {
+	if len(tasks) == 0 {
+		close(outChan)
+		log.Println("[Downloader] Nenhum arquivo para baixar.")
+		return nil
+	}
+
+	defer close(outChan)
+
+	log.Printf("[Downloader] Iniciando download de %d arquivo(s) com %d worker(s)...", len(tasks), d.Workers)
+
+	taskChan := make(chan DownloadTask, len(tasks))
+	errChan := make(chan error, len(tasks))
+	var wg sync.WaitGroup
+
+	// Launch worker pool
+	for i := 1; i <= d.Workers; i++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			for task := range taskChan {
+				log.Printf("[Download Worker %d] Baixando %s...", workerID, task.Filename)
+				if err := d.downloadFile(task); err != nil {
+					log.Printf("[Download Worker %d] ERRO ao baixar %s: %v", workerID, task.Filename, err)
+					errChan <- fmt.Errorf("failed downloading %s: %w", task.Filename, err)
+					return
+				}
+				log.Printf("[Download Worker %d] Concluído download: %s", workerID, task.Filename)
+				outChan <- task
+			}
+		}(i)
+	}
+
+	for _, task := range tasks {
+		taskChan <- task
+	}
+	close(taskChan)
+
+	wg.Wait()
+	close(errChan)
+
+	// Return the first error if any worker failed
+	for err := range errChan {
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 func (d *Downloader) DownloadStream(tasks []DownloadTask, onComplete func(task DownloadTask) error) error {

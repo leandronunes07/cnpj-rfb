@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -143,65 +144,46 @@ func (p *Pipeline) Run() error {
 		})
 	}
 
-	// Download & Stream Load Phase (Intercalado).
-	// Cada worker do downloader processa (descompacta + importa) o arquivo que
-	// ele mesmo baixou, sem lock global: como cada arquivo vai para sua própria
-	// subpasta de extração e cada InsertBatch abre sua própria transação, até
-	// DOWNLOAD_WORKERS arquivos podem ser importados em paralelo com segurança
-	// (bancos com múltiplas conexões escalam; SQLite, limitado a 1 conexão,
-	// naturalmente serializa via o pool sem precisar de lock explícito aqui).
+	// Download & Stream Load Phase (Producer-Consumer desacoplado).
+	// X workers de download alimentam a fila; Y workers de importação processam em paralelo.
 	startTime := time.Now()
 
-	err = p.downloader.DownloadStream(tasks, func(task downloader.DownloadTask) error {
-		log.Printf("[ETL Pipeline] Processando imediatamente arquivo baixado: %s", task.Filename)
+	downloadedChan := make(chan downloader.DownloadTask, len(tasks))
+	var importWg sync.WaitGroup
+	var importErrOnce sync.Once
+	var firstImportErr error
 
-		taskExtractDir := filepath.Join(p.cfg.ExtractedDir, strings.TrimSuffix(task.Filename, filepath.Ext(task.Filename)))
-		extractedFiles, err := p.extractor.ExtractZip(task.DestPath, taskExtractDir)
-		if err != nil {
-			log.Printf("[ETL Pipeline] ERRO ao descompactar %s: %v", task.Filename, err)
-			return nil
-		}
+	importWorkers := p.cfg.ImportWorkers
+	if importWorkers <= 0 {
+		importWorkers = 1
+	}
 
-		matchedCount := 0
-		fileImportSuccess := true
-		for _, extFile := range extractedFiles {
-			baseName := filepath.Base(extFile)
-			tableSpec := matchTableSpec(baseName)
-			if tableSpec == nil {
-				log.Printf("[ETL Pipeline] Nenhum schema correspondente para arquivo %s (ignorado).", baseName)
-				continue
+	log.Printf("[ETL Pipeline] Iniciando pool de importação com %d worker(s) (Download: %d worker(s))...", importWorkers, p.cfg.DownloadWorkers)
+
+	for i := 1; i <= importWorkers; i++ {
+		importWg.Add(1)
+		go func(workerID int) {
+			defer importWg.Done()
+			for task := range downloadedChan {
+				log.Printf("[Import Worker %d] Processando imediatamente arquivo baixado: %s", workerID, task.Filename)
+				if err := p.processDownloadedFile(task, targetMonth, workerID); err != nil {
+					log.Printf("[Import Worker %d] ERRO ao processar %s: %v", workerID, task.Filename, err)
+					importErrOnce.Do(func() {
+						firstImportErr = err
+					})
+				}
 			}
+		}(i)
+	}
 
-			matchedCount++
-			log.Printf("[ETL Pipeline] Importando dados de %s para a tabela `%s`...", baseName, tableSpec.Name)
-			if err := p.importFileToTable(extFile, *tableSpec, targetMonth); err != nil {
-				log.Printf("[ETL Pipeline] ERRO ao importar %s para `%s`: %v", baseName, tableSpec.Name, err)
-				fileImportSuccess = false
-			}
-		}
+	downloadErr := p.downloader.DownloadStreamToChannel(tasks, downloadedChan)
+	importWg.Wait()
 
-		// Clean up extracted dir + zip file immediately
-		if p.cfg.AutoCleanup {
-			_ = os.RemoveAll(taskExtractDir)
-			_ = os.Remove(task.DestPath)
-			log.Printf("[Auto-Cleanup] Arquivos extraídos e ZIP removidos: %s", task.Filename)
-		}
-
-		if matchedCount > 0 && fileImportSuccess {
-			if err := p.db.SaveProcessedFile(targetMonth, task.Filename, "SUCCESS"); err != nil {
-				log.Printf("[ETL Pipeline] ERRO ao registrar arquivo %s no banco: %v", task.Filename, err)
-			} else {
-				log.Printf("[ETL Pipeline] Arquivo %s importado no banco e registrado com sucesso!", task.Filename)
-			}
-		} else if matchedCount == 0 {
-			log.Printf("[ETL Pipeline] ATENÇÃO: NENHUM SCHEMA CORRESPONDIDO para %s. O arquivo NÃO foi marcado como concluído no banco.", task.Filename)
-		}
-
-		return nil
-	})
-
-	if err != nil {
-		return fmt.Errorf("falha no pipeline de download e carga: %w", err)
+	if downloadErr != nil {
+		return fmt.Errorf("falha no pipeline de download: %w", downloadErr)
+	}
+	if firstImportErr != nil {
+		return fmt.Errorf("falha no pipeline de importação: %w", firstImportErr)
 	}
 
 	// Build secondary indexes now that the bulk load is done, instead of
@@ -290,6 +272,54 @@ func (p *Pipeline) SyncSearchIndex() {
 	}
 
 	log.Printf("[Search] Índice de busca sincronizado: %d registros em %v.", total, time.Since(start))
+}
+
+func (p *Pipeline) processDownloadedFile(task downloader.DownloadTask, targetMonth string, workerID int) error {
+	taskExtractDir := filepath.Join(p.cfg.ExtractedDir, strings.TrimSuffix(task.Filename, filepath.Ext(task.Filename)))
+	extractedFiles, err := p.extractor.ExtractZip(task.DestPath, taskExtractDir)
+	if err != nil {
+		log.Printf("[Import Worker %d] ERRO ao descompactar %s: %v", workerID, task.Filename, err)
+		return err
+	}
+
+	matchedCount := 0
+	fileImportSuccess := true
+	for _, extFile := range extractedFiles {
+		baseName := filepath.Base(extFile)
+		tableSpec := matchTableSpec(baseName)
+		if tableSpec == nil {
+			log.Printf("[Import Worker %d] Nenhum schema correspondente para arquivo %s (ignorado).", workerID, baseName)
+			continue
+		}
+
+		matchedCount++
+		log.Printf("[Import Worker %d] Importando dados de %s para a tabela `%s`...", workerID, baseName, tableSpec.Name)
+		if err := p.importFileToTable(extFile, *tableSpec, targetMonth); err != nil {
+			log.Printf("[Import Worker %d] ERRO ao importar %s para `%s`: %v", workerID, baseName, tableSpec.Name, err)
+			fileImportSuccess = false
+		}
+	}
+
+	// Clean up extracted dir + zip file immediately
+	if p.cfg.AutoCleanup {
+		_ = os.RemoveAll(taskExtractDir)
+		_ = os.Remove(task.DestPath)
+		log.Printf("[Auto-Cleanup] Arquivos extraídos e ZIP removidos: %s", task.Filename)
+	}
+
+	if matchedCount > 0 && fileImportSuccess {
+		if err := p.db.SaveProcessedFile(targetMonth, task.Filename, "SUCCESS"); err != nil {
+			log.Printf("[Import Worker %d] ERRO ao registrar arquivo %s no banco: %v", workerID, task.Filename, err)
+			return err
+		}
+		log.Printf("[Import Worker %d] Arquivo %s importado no banco e registrado com sucesso!", workerID, task.Filename)
+	} else if matchedCount == 0 {
+		log.Printf("[Import Worker %d] ATENÇÃO: NENHUM SCHEMA CORRESPONDIDO para %s. O arquivo NÃO foi marcado como concluído no banco.", workerID, task.Filename)
+	} else if !fileImportSuccess {
+		return fmt.Errorf("falha ao importar dados do arquivo %s", task.Filename)
+	}
+
+	return nil
 }
 
 func (p *Pipeline) importFileToTable(filePath string, table schema.TableSpec, competencia string) error {
